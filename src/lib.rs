@@ -1,4 +1,3 @@
-pub mod connection;
+pub mod conn_manager;
 pub mod handshake;
-pub mod peer_table;
 pub mod util;

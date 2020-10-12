@@ -1,9 +1,11 @@
-use aw_rs::connection::{Connection, ConnectionPool};
-use aw_rs::peer_table::{self, PeerID, PeerTable, PeerTableHandle};
-use parity_crypto::publickey::{Generator, KeyPair, Public, Random};
+use aw_rs::conn_manager::connection::ConnectionPool;
+use aw_rs::conn_manager::peer_table::PeerTable;
+use aw_rs::conn_manager::{self, ConnectionManager};
+use parity_crypto::publickey::{Generator, Public, Random};
 use std::env;
-use std::net::SocketAddr;
-use tokio::net::{self, TcpStream};
+use std::net::{IpAddr, Ipv4Addr};
+use std::sync::{Arc, Mutex};
+use tokio::net;
 
 #[tokio::main]
 async fn main() {
@@ -45,7 +47,7 @@ async fn main() {
                 }
             }
         }
-        Err(e) => {
+        Err(_e) => {
             // TODO
             return;
         }
@@ -54,100 +56,25 @@ async fn main() {
     // Own keypair.
     let keypair = Random.generate();
 
-    let conn = connect_with_retry(&keypair, &peer_pubkey, addr);
-}
+    let max_connections = 10;
+    let pool = ConnectionPool::new_with_max_connections_allocated(max_connections);
+    let table = PeerTable::new();
+    let conn_manager = Arc::new(Mutex::new(ConnectionManager::new(pool, table)));
 
-async fn connect_with_retry<'a>(
-    keypair: &KeyPair,
-    peer_pubkey: &Public,
-    addr: SocketAddr,
-    peer_table: PeerTableHandle,
-    pool: &'a mut ConnectionPool,
-) -> Result<&'a mut Connection, ()> {
-    let mut backoff = std::time::Duration::from_secs(1);
-    loop {
-        {
-            let maybe_conn = get_peer_connection_mut(
-                &peer_table::id_from_pubkey(peer_pubkey),
-                &peer_table,
-                pool,
-            );
-            match maybe_conn {
-                Some(conn) => return Ok(conn),
-                _ => (),
-            }
-            drop(maybe_conn);
-        }
-        match net::TcpStream::connect(addr).await {
-            Ok(mut stream) => {
-                let key = aw_rs::handshake::client_handshake(&mut stream, keypair, peer_pubkey)
-                    .await
-                    .map_err(|_| ())?;
-                let conn = Connection::new(stream, &key);
-                pool.add_connection(conn);
-                let conn = pool.get_conn_mut(&addr).expect("");
-                return Ok(conn);
-            }
-            Err(e) => {
-                tokio::time::delay_for(backoff).await;
-                backoff = backoff.mul_f32(1.6);
-            }
-        }
-    }
-}
+    tokio::spawn(conn_manager::listen_for_peers(
+        conn_manager.clone(),
+        IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)),
+        addr.port(),
+        keypair.clone(),
+    ));
 
-fn get_peer_connection_mut<'a>(
-    id: &PeerID,
-    peer_table: &PeerTableHandle,
-    pool: &'a mut ConnectionPool,
-) -> Option<&'a mut Connection> {
-    let maybe_addr = {
-        let peer_table = match peer_table.lock() {
-            Ok(table) => table,
-            Err(e) => e.into_inner(),
-        };
-        peer_table.peer_addr(id).cloned()
-    };
-    if let Some(addr) = maybe_addr {
-        if let Some(conn) = pool.get_conn_mut(&addr) {
-            Some(conn)
-        } else {
-            None
-        }
-    } else {
-        None
-    }
-}
-
-async fn send_to_peer(
-    id: &PeerID,
-    msg: &[u8],
-    peer_table: PeerTableHandle,
-    pool: &mut ConnectionPool,
-) -> Result<(), ()> {
-    let maybe_addr = {
-        let peer_table = match peer_table.lock() {
-            Ok(table) => table,
-            Err(e) => e.into_inner(),
-        };
-        peer_table.peer_addr(id).cloned()
-    };
-    if let Some(addr) = maybe_addr {
-        if let Some(conn) = pool.get_conn_mut(&addr) {
-            conn.write_encrypted_authenticated(msg)
-                .await
-                .map_err(|_| ())?;
-        } else {
-            // TODO(ross): There is no live connection for the peer; do we try to establish one
-            // now?
-            todo!()
-        }
-    } else {
-        // TODO(ross): Peer is not in peer table; do we go and try to query other peers to get the
-        // information we need now?
-        todo!()
-    }
-    unimplemented!()
+    let mut conn =
+        conn_manager::get_connection_or_establish(&keypair, &peer_pubkey, addr, &conn_manager)
+            .await
+            .expect("obtaining connection");
+    conn.write(&[1, 2, 3, 4])
+        .await
+        .expect("writing to connection");
 }
 
 fn lower_hex_char_to_nibble(c: char) -> Option<u8> {

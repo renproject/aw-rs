@@ -7,9 +7,11 @@ use tokio::net::TcpStream;
 
 pub struct Connection {
     stream: TcpStream,
+    key: [u8; 32],
     cipher: Aes256Gcm,
 }
 
+#[derive(Debug)]
 pub enum Error {
     Write(io::Error),
     Encryption(aead::Error),
@@ -17,9 +19,13 @@ pub enum Error {
 }
 
 impl Connection {
-    pub fn new(stream: TcpStream, key: &[u8]) -> Self {
-        let cipher = aes_gcm::AesGcm::new(GenericArray::from_slice(key));
-        Self { stream, cipher }
+    pub fn new(stream: TcpStream, key: [u8; 32]) -> Self {
+        let cipher = aes_gcm::AesGcm::new(GenericArray::from_slice(&key));
+        Self {
+            stream,
+            key,
+            cipher,
+        }
     }
 
     pub async fn write_encrypted_authenticated(&mut self, msg: &[u8]) -> Result<(), Error> {
@@ -37,12 +43,21 @@ pub struct ConnectionPool {
     connections: HashMap<SocketAddr, Connection>,
 }
 
+#[derive(Debug)]
 pub enum PoolError {
     TooManyConnections,
     PeerAddr(std::io::Error),
 }
 
 impl ConnectionPool {
+    pub fn new_with_max_connections_allocated(max_connections: usize) -> Self {
+        let connections = HashMap::with_capacity(max_connections);
+        Self {
+            max_connections,
+            connections,
+        }
+    }
+
     pub fn add_connection(&mut self, conn: Connection) -> Result<Option<Connection>, PoolError> {
         use PoolError::*;
 
@@ -50,8 +65,21 @@ impl ConnectionPool {
             Err(TooManyConnections)
         } else {
             let peer_addr = conn.stream.peer_addr().map_err(PeerAddr)?;
+            if let Some(existing) = self.connections.get_mut(&peer_addr) {
+                if existing.key > conn.key {
+                    return Ok(Some(std::mem::replace(existing, conn)));
+                }
+            }
             Ok(self.connections.insert(peer_addr, conn))
         }
+    }
+
+    pub fn num_connections(&self) -> usize {
+        self.connections.len()
+    }
+
+    pub fn is_full(&self) -> bool {
+        self.num_connections() == self.max_connections
     }
 
     pub fn get_conn_mut(&mut self, addr: &SocketAddr) -> Option<&mut Connection> {

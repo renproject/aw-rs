@@ -4,7 +4,10 @@ use core::{
 };
 use std::io::{self, ErrorKind, Read, Write};
 use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncRead, AsyncWrite};
+
+pub type SharedPtr<T> = Arc<Mutex<T>>;
 
 pub struct ChannelRW {
     reader: Receiver<Vec<u8>>,
