@@ -22,6 +22,18 @@ impl ConnectionManager {
     pub fn new(pool: ConnectionPool, table: PeerTable) -> Self {
         Self { pool, table }
     }
+
+    pub fn send_to_all(&mut self, msg: &[u8]) -> Result<(), Error> {
+        for (_, conn) in self.pool.iter_mut() {
+            futures::executor::block_on(conn.write(&msg)).map_err(Error::Connection)?;
+        }
+        Ok(())
+    }
+
+    pub fn add_peer(&mut self, pubkey: &Public, addr: SocketAddr) {
+        self.table
+            .add_peer(peer_table::id_from_pubkey(pubkey), addr);
+    }
 }
 
 pub struct ConnectionGuard<'a> {

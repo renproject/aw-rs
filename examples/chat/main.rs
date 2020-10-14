@@ -1,7 +1,10 @@
 use aw_rs::conn_manager::connection::ConnectionPool;
 use aw_rs::conn_manager::peer_table::PeerTable;
 use aw_rs::conn_manager::{self, ConnectionManager};
-use parity_crypto::publickey::{Generator, Public, Random};
+use aw_rs::util::SharedPtr;
+use parity_crypto::publickey;
+use parity_crypto::publickey::{Generator, KeyPair, Public, Random};
+use std::io::BufRead;
 // use std::env;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::str::FromStr;
@@ -56,12 +59,10 @@ async fn main() {
     };
     */
 
-    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 12345);
+    // let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 12345);
     let keypair = Random.generate();
-    println!("own keypair: {:x?}", keypair.public());
-
-    // let peer = None;
-    let peer = Some(Public::from_str("fa85cc71a2d291574b5f9ff424018229969ee3aceff8a88fc514c490be7ef7898023e411b966b14e618f53e4dc8223ae873e60938f0ab420208d608a64f07633").unwrap());
+    println!("own pubkey: {:x?}", keypair.public());
+    println!("own address: {:?}", keypair.address());
 
     let max_connections = 10;
     let (pool, mut reads) = ConnectionPool::new_with_max_connections_allocated(max_connections);
@@ -75,21 +76,119 @@ async fn main() {
         12346,
     ));
 
-    if let Some(peer) = peer {
-        let mut conn =
-            conn_manager::get_connection_or_establish(&conn_manager, &keypair, &peer, addr)
-                .await
-                .expect("obtaining connection");
-        conn.write(&[1, 2, 3, 4])
-            .await
-            .expect("writing to connection");
-    } else {
-        while let Some((sender, msg)) = reads.recv().await {
-            println!("{:?}: {:?}", sender, msg);
-        }
+    let cm = conn_manager.clone();
+    tokio::task::spawn_blocking(|| read_input(cm, keypair));
+
+    while let Some((sender, msg)) = reads.recv().await {
+        println!(
+            "{}: {}",
+            publickey::public_to_address(&sender),
+            std::str::from_utf8(&msg).unwrap()
+        );
     }
 
     listen_handle.await.unwrap().unwrap();
+}
+
+fn read_input(conn_manager: SharedPtr<ConnectionManager>, keypair: KeyPair) {
+    let stdin = std::io::stdin();
+    let lock = stdin.lock();
+    for line in lock.lines() {
+        let line = line.expect("TODO");
+        println!("parsing: {:?}", line);
+        if let Err(e) = parse_input(&conn_manager, &keypair, &line) {
+            eprintln!("{:?}", e);
+        }
+    }
+}
+
+#[derive(Debug)]
+enum ParseError {
+    CommandFailed,
+    InvalidCommand,
+    InvalidInput,
+    InvalidArguments,
+}
+
+fn parse_input(
+    conn_manager: &SharedPtr<ConnectionManager>,
+    keypair: &KeyPair,
+    input: &str,
+) -> Result<(), ParseError> {
+    if input.starts_with("/") && !input.starts_with("//") {
+        return futures::executor::block_on(parse_command(
+            conn_manager,
+            keypair,
+            input.strip_prefix("/").unwrap(),
+        ));
+    }
+
+    if input.starts_with("@") {
+        // TODO(ross): Direct message.
+    }
+
+    if input.starts_with("#") {
+        // TODO(ross): Subnet message.
+    }
+
+    if input.starts_with("*") {
+        let mut conn_manager_lock = match conn_manager.lock() {
+            Ok(lock) => lock,
+            Err(e) => e.into_inner(),
+        };
+        conn_manager_lock
+            .send_to_all(&input[1..].as_bytes())
+            .expect("TODO");
+        return Ok(());
+    }
+
+    Err(ParseError::InvalidInput)
+}
+
+async fn parse_command(
+    conn_manager: &SharedPtr<ConnectionManager>,
+    keypair: &KeyPair,
+    command: &str,
+) -> Result<(), ParseError> {
+    use ParseError::*;
+
+    let mut words = command.split_ascii_whitespace();
+    let command = words.next().ok_or(InvalidCommand)?;
+
+    match command {
+        "add" => {
+            println!("adding peer...");
+            let mut conn_manager_lock = match conn_manager.lock() {
+                Ok(lock) => lock,
+                Err(e) => e.into_inner(),
+            };
+            let pubkey = words
+                .next()
+                .ok_or(InvalidArguments)
+                .and_then(|s| Public::from_str(s).map_err(|_| InvalidArguments))?;
+            let addr = words
+                .next()
+                .ok_or(InvalidArguments)
+                .and_then(|s| SocketAddr::from_str(s).map_err(|_| InvalidArguments))?;
+            conn_manager_lock.add_peer(&pubkey, addr);
+            Ok(())
+        }
+        "connect" => {
+            let pubkey = words
+                .next()
+                .ok_or(InvalidArguments)
+                .and_then(|s| Public::from_str(s).map_err(|_| InvalidArguments))?;
+            let addr = words
+                .next()
+                .ok_or(InvalidArguments)
+                .and_then(|s| SocketAddr::from_str(s).map_err(|_| InvalidArguments))?;
+            conn_manager::get_connection_or_establish(conn_manager, keypair, &pubkey, addr)
+                .await
+                .map_err(|_| CommandFailed)?;
+            Ok(())
+        }
+        _ => Err(InvalidCommand),
+    }
 }
 
 /*
