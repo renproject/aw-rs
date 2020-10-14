@@ -10,7 +10,7 @@ use tokio::stream::StreamExt;
 pub mod connection;
 pub mod peer_table;
 
-use connection::{Connection, ConnectionPool};
+use connection::ConnectionPool;
 use peer_table::PeerTable;
 
 pub struct ConnectionManager {
@@ -24,12 +24,39 @@ impl ConnectionManager {
     }
 }
 
+pub struct ConnectionGuard<'a> {
+    addr: SocketAddr,
+    guard: MutexGuard<'a, ConnectionManager>,
+}
+
+impl<'a> ConnectionGuard<'a> {
+    pub async fn write(&mut self, msg: &[u8]) -> Result<(), Error> {
+        self.guard
+            .pool
+            .get_conn_mut(&self.addr)
+            .expect("connection should exist")
+            .write(msg)
+            .await
+            .map_err(Error::Connection)
+    }
+}
+
+#[derive(Debug)]
+pub enum Error {
+    Handshake(handshake::Error),
+    Connection(connection::Error),
+    Pool(connection::PoolError),
+    Tcp(tokio::io::Error),
+}
+
 pub async fn get_connection_or_establish<'a>(
+    conn_manager: &'a SharedPtr<ConnectionManager>,
     keypair: &KeyPair,
     peer_pubkey: &Public,
     addr: SocketAddr,
-    conn_manager: &'a SharedPtr<ConnectionManager>,
-) -> Result<ConnectionGuard<'a>, ()> {
+) -> Result<ConnectionGuard<'a>, Error> {
+    use Error::*;
+
     let mut backoff = Duration::from_secs(1);
     let id = peer_table::id_from_pubkey(peer_pubkey);
     loop {
@@ -61,17 +88,16 @@ pub async fn get_connection_or_establish<'a>(
             Ok(mut stream) => {
                 let key = handshake::client_handshake(&mut stream, keypair, peer_pubkey)
                     .await
-                    .map_err(|_| todo!())?;
-                let conn = Connection::new(stream, key);
+                    .map_err(Handshake)?;
                 let mut conn_manager_lock = match conn_manager.lock() {
                     Ok(lock) => lock,
                     Err(e) => e.into_inner(),
                 };
                 conn_manager_lock
                     .pool
-                    .add_connection(conn)
+                    .add_connection(stream, *peer_pubkey, key)
                     .map(drop)
-                    .map_err(|_| todo!())?;
+                    .map_err(Pool)?;
                 return Ok(ConnectionGuard {
                     addr,
                     guard: conn_manager_lock,
@@ -88,56 +114,59 @@ pub async fn get_connection_or_establish<'a>(
 
 pub async fn listen_for_peers(
     conn_manager: SharedPtr<ConnectionManager>,
+    keypair: KeyPair,
     addr: IpAddr,
     port: u16,
-    keypair: KeyPair,
-) -> Result<(), ()> {
+) -> Result<(), Error> {
+    use Error::*;
+
     let mut listener = TcpListener::bind(SocketAddr::new(addr, port))
         .await
-        .map_err(|_| todo!())?;
+        .map_err(Tcp)?;
     while let Some(stream) = listener.incoming().next().await {
-        let mut stream = stream.map_err(|_| todo!()).expect("TODO");
-        let keypair = keypair.clone();
-        let conn_manager = conn_manager.clone();
-        tokio::spawn(async move {
-            match handshake::server_handshake(&mut stream, &keypair).await {
-                Ok((key, client_pubkey)) => {
-                    let mut conn_manager_lock = match conn_manager.lock() {
-                        Ok(lock) => lock,
-                        Err(e) => e.into_inner(),
-                    };
-                    let id = peer_table::id_from_pubkey(&client_pubkey);
-                    let addr = stream.peer_addr().expect("TODO");
-                    conn_manager_lock.table.add_peer(id, addr);
-                    let conn = Connection::new(stream, key);
-                    if let Some(_replaced) =
-                        conn_manager_lock.pool.add_connection(conn).expect("TODO")
-                    {
-                        // TODO(ross): Do we want to create logs when replacing duplicate
-                        // connections?
+        match stream {
+            Ok(mut stream) => {
+                let keypair = keypair.clone();
+                let conn_manager = conn_manager.clone();
+                tokio::spawn(async move {
+                    println!("[listener] incoming connection, starting handshake");
+                    match handshake::server_handshake(&mut stream, &keypair).await {
+                        Ok((key, client_pubkey)) => {
+                            println!("[listener] successful handhsake");
+                            let mut conn_manager_lock = match conn_manager.lock() {
+                                Ok(lock) => lock,
+                                Err(e) => e.into_inner(),
+                            };
+                            let id = peer_table::id_from_pubkey(&client_pubkey);
+                            let addr = stream.peer_addr().expect("TODO");
+                            conn_manager_lock.table.add_peer(id, addr);
+                            match conn_manager_lock
+                                .pool
+                                .add_connection(stream, client_pubkey, key)
+                            {
+                                Ok(replaced) => {
+                                    if let Some(_replaced) = replaced {
+                                        // TODO(ross): Do we want to create logs when replacing
+                                        // duplicate connections?
+                                    }
+                                    println!("[listener] connection added to pool");
+                                }
+                                Err(_e) => {
+                                    // TODO(ross): What to do when the pool is full?
+                                }
+                            }
+                        }
+                        Err(_e) => {
+                            // TODO(ross): Should we log failed handshake attempts?
+                        }
                     }
-                }
-                Err(_e) => todo!(),
+                });
             }
-        });
+            Err(_e) => {
+                // TODO(ross): Do we want to log this?
+            }
+        }
     }
 
     Ok(())
-}
-
-pub struct ConnectionGuard<'a> {
-    addr: SocketAddr,
-    guard: MutexGuard<'a, ConnectionManager>,
-}
-
-impl<'a> ConnectionGuard<'a> {
-    pub async fn write(&mut self, msg: &[u8]) -> Result<(), ()> {
-        self.guard
-            .pool
-            .get_conn_mut(&self.addr)
-            .expect("connection should exist")
-            .write_encrypted_authenticated(msg)
-            .await
-            .map_err(|_| todo!())
-    }
 }

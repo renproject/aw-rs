@@ -2,13 +2,15 @@ use aw_rs::conn_manager::connection::ConnectionPool;
 use aw_rs::conn_manager::peer_table::PeerTable;
 use aw_rs::conn_manager::{self, ConnectionManager};
 use parity_crypto::publickey::{Generator, Public, Random};
-use std::env;
-use std::net::{IpAddr, Ipv4Addr};
+// use std::env;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::str::FromStr;
 use std::sync::{Arc, Mutex};
-use tokio::net;
+// use tokio::net;
 
 #[tokio::main]
 async fn main() {
+    /*
     let mut args: Vec<String> = env::args().collect();
     if args.len() > 3 {
         eprintln!("too many arguments: expected 2, got {:?}", args.len() - 1);
@@ -52,34 +54,49 @@ async fn main() {
             return;
         }
     };
+    */
 
-    // Own keypair.
+    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 12345);
     let keypair = Random.generate();
+    println!("own keypair: {:x?}", keypair.public());
+
+    // let peer = None;
+    let peer = Some(Public::from_str("fa85cc71a2d291574b5f9ff424018229969ee3aceff8a88fc514c490be7ef7898023e411b966b14e618f53e4dc8223ae873e60938f0ab420208d608a64f07633").unwrap());
 
     let max_connections = 10;
-    let pool = ConnectionPool::new_with_max_connections_allocated(max_connections);
+    let (pool, mut reads) = ConnectionPool::new_with_max_connections_allocated(max_connections);
     let table = PeerTable::new();
     let conn_manager = Arc::new(Mutex::new(ConnectionManager::new(pool, table)));
 
-    tokio::spawn(conn_manager::listen_for_peers(
+    let listen_handle = tokio::spawn(conn_manager::listen_for_peers(
         conn_manager.clone(),
-        IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)),
-        addr.port(),
         keypair.clone(),
+        IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)),
+        12346,
     ));
 
-    let mut conn =
-        conn_manager::get_connection_or_establish(&keypair, &peer_pubkey, addr, &conn_manager)
+    if let Some(peer) = peer {
+        let mut conn =
+            conn_manager::get_connection_or_establish(&conn_manager, &keypair, &peer, addr)
+                .await
+                .expect("obtaining connection");
+        conn.write(&[1, 2, 3, 4])
             .await
-            .expect("obtaining connection");
-    conn.write(&[1, 2, 3, 4])
-        .await
-        .expect("writing to connection");
+            .expect("writing to connection");
+    } else {
+        while let Some((sender, msg)) = reads.recv().await {
+            println!("{:?}: {:?}", sender, msg);
+        }
+    }
+
+    listen_handle.await.unwrap().unwrap();
 }
 
+/*
 fn lower_hex_char_to_nibble(c: char) -> Option<u8> {
     if !c.is_ascii_hexdigit() || c.is_uppercase() {
         return None;
     }
     Some(c as u8 - b'0')
 }
+*/
