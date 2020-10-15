@@ -98,6 +98,8 @@ pub async fn get_connection_or_establish<'a>(
 
         match TcpStream::connect(addr).await {
             Ok(mut stream) => {
+                println!("[info] recv_buffer_size = {:?}", stream.recv_buffer_size());
+                println!("[info] send_buffer_size = {:?}", stream.send_buffer_size());
                 let key = handshake::client_handshake(&mut stream, keypair, peer_pubkey)
                     .await
                     .map_err(Handshake)?;

@@ -4,62 +4,22 @@ use aw_rs::conn_manager::{self, ConnectionManager};
 use aw_rs::util::SharedPtr;
 use parity_crypto::publickey;
 use parity_crypto::publickey::{Generator, KeyPair, Public, Random};
+use std::env;
 use std::io::BufRead;
-// use std::env;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
-// use tokio::net;
 
 #[tokio::main]
 async fn main() {
-    /*
     let mut args: Vec<String> = env::args().collect();
-    if args.len() > 3 {
-        eprintln!("too many arguments: expected 2, got {:?}", args.len() - 1);
+    if args.len() > 2 {
+        eprintln!("too many arguments: expected 1, got {:?}", args.len() - 1);
         return;
     }
     let addr_str = args.pop().expect("address arg");
-    let pubkey_str = args.pop().expect("pubkey arg");
+    let port = addr_str.parse().expect("invalid port argument");
 
-    // Parse peer ID.
-    if pubkey_str.len() != 128 {
-        // TODO
-        return;
-    }
-    let mut pubkey_bytes = [0u8; 64];
-    for i in 0..32 {
-        let lower = lower_hex_char_to_nibble(pubkey_str.bytes().nth(2 * i).unwrap() as char);
-        let upper = lower_hex_char_to_nibble(pubkey_str.bytes().nth(2 * i + 1).unwrap() as char);
-        match (lower, upper) {
-            (Some(lower), Some(upper)) => pubkey_bytes[i] = lower + (upper << 4),
-            _ => {
-                // TODO
-                return;
-            }
-        }
-    }
-    let peer_pubkey = Public::from_slice(&pubkey_bytes);
-
-    // Parse peer address.
-    let addr = match net::lookup_host(addr_str).await {
-        Ok(mut iter) => {
-            match iter.next() {
-                Some(addr) => addr,
-                None => {
-                    // TODO
-                    return;
-                }
-            }
-        }
-        Err(_e) => {
-            // TODO
-            return;
-        }
-    };
-    */
-
-    // let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 12345);
     let keypair = Random.generate();
     println!("own pubkey: {:x?}", keypair.public());
     println!("own address: {:?}", keypair.address());
@@ -73,7 +33,7 @@ async fn main() {
         conn_manager.clone(),
         keypair.clone(),
         IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)),
-        12346,
+        port,
     ));
 
     let cm = conn_manager.clone();
@@ -95,7 +55,6 @@ fn read_input(conn_manager: SharedPtr<ConnectionManager>, keypair: KeyPair) {
     let lock = stdin.lock();
     for line in lock.lines() {
         let line = line.expect("TODO");
-        println!("parsing: {:?}", line);
         if let Err(e) = parse_input(&conn_manager, &keypair, &line) {
             eprintln!("{:?}", e);
         }
@@ -157,7 +116,6 @@ async fn parse_command(
 
     match command {
         "add" => {
-            println!("adding peer...");
             let mut conn_manager_lock = match conn_manager.lock() {
                 Ok(lock) => lock,
                 Err(e) => e.into_inner(),
