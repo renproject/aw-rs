@@ -4,23 +4,23 @@ use parity_crypto::publickey::Public;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use tokio::io::{self, AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
+use tokio::net::{
+    tcp::{OwnedReadHalf, OwnedWriteHalf},
+    TcpStream,
+};
 use tokio::sync::{mpsc, oneshot};
 
 pub fn new_encrypted_connection_task(
-    stream: TcpStream,
+    read_half: OwnedReadHalf,
     pubkey: Public,
     cipher: Aes256Gcm,
     reads: mpsc::Sender<(Public, Vec<u8>)>,
-    writes: mpsc::Receiver<(Vec<u8>, oneshot::Sender<tokio::io::Result<()>>)>,
 ) -> oneshot::Sender<()> {
     let (cancel_tx, cancel_rx) = oneshot::channel();
-    let (reader, writer) = stream.into_split();
-    let read_fut = read_into_sender(pubkey, cipher.clone(), reader, reads);
-    let write_fut = write_out_from_receiver(cipher, writes, writer);
+    let read_fut = read_into_sender(pubkey, cipher.clone(), read_half, reads);
     tokio::spawn(async {
         tokio::select! {
-            _ = futures::future::join(read_fut, write_fut) => (),
+            _ = read_fut => (),
             _ = cancel_rx => (),
         }
     });
@@ -56,28 +56,11 @@ async fn read_into_sender<R: AsyncReadExt + Unpin>(
     Err(())
 }
 
-async fn write_out_from_receiver<W: AsyncWriteExt + Unpin>(
-    cipher: Aes256Gcm,
-    mut receiver: mpsc::Receiver<(Vec<u8>, oneshot::Sender<tokio::io::Result<()>>)>,
-    mut writer: W,
-) -> Result<(), ()> {
-    while let Some((data, res)) = receiver.recv().await {
-        // FIXME(ross): Nonce reuse is catastrophic, so make sure to decide on how to pick the
-        // nonce before using this in any important systems. We will set the nonce to a constant
-        // for now for testing purposes.
-        let nonce = [0u8; 12];
-        let nonce = GenericArray::from_slice(&nonce);
-        let enc = cipher.encrypt(nonce, &data[..]).expect("TODO");
-
-        res.send(writer.write_all(&enc).await).ok();
-    }
-    Err(())
-}
-
 pub struct Connection {
-    writer: mpsc::Sender<(Vec<u8>, oneshot::Sender<tokio::io::Result<()>>)>,
+    write_half: OwnedWriteHalf,
     cancel: oneshot::Sender<()>,
     key: [u8; 32],
+    cipher: Aes256Gcm,
 }
 
 #[derive(Debug)]
@@ -89,30 +72,25 @@ pub enum Error {
 }
 
 impl Connection {
-    pub fn new(
-        key: [u8; 32],
-        writer: mpsc::Sender<(Vec<u8>, oneshot::Sender<tokio::io::Result<()>>)>,
-        cancel: oneshot::Sender<()>,
-    ) -> Self {
+    pub fn new(key: [u8; 32], write_half: OwnedWriteHalf, cancel: oneshot::Sender<()>) -> Self {
+        let cipher = aes_gcm::AesGcm::new(GenericArray::from_slice(&key));
         Self {
-            writer,
+            write_half,
             cancel,
             key,
+            cipher,
         }
     }
 
     pub async fn write(&mut self, msg: &[u8]) -> Result<(), Error> {
-        use Error::*;
+        // FIXME(ross): Nonce reuse is catastrophic, so make sure to decide on how to pick the
+        // nonce before using this in any important systems. We will set the nonce to a constant
+        // for now for testing purposes.
+        let nonce = [0u8; 12];
+        let nonce = GenericArray::from_slice(&nonce);
+        let enc = self.cipher.encrypt(nonce, msg).map_err(Error::Encryption)?;
 
-        let (res_tx, res_rx) = oneshot::channel();
-        self.writer
-            .send((msg.into(), res_tx))
-            .await
-            .map_err(|e| Write(tokio::io::Error::new(tokio::io::ErrorKind::BrokenPipe, e)))?;
-        res_rx
-            .await
-            .unwrap_or_else(|e| Err(tokio::io::Error::new(tokio::io::ErrorKind::BrokenPipe, e)))
-            .map_err(Write)
+        self.write_half.write_all(&enc).await.map_err(Error::Write)
     }
 }
 
@@ -158,29 +136,23 @@ impl ConnectionPool {
             let peer_addr = stream.peer_addr().map_err(PeerAddr)?;
             if let Some(existing) = self.connections.get_mut(&peer_addr) {
                 if existing.key > key {
-                    let (write_tx, write_rx) = mpsc::channel(100);
                     let cipher = aes_gcm::AesGcm::new(GenericArray::from_slice(&key));
+                    let (read_half, write_half) = stream.into_split();
                     let cancel = new_encrypted_connection_task(
-                        stream,
+                        read_half,
                         pubkey,
                         cipher,
                         self.reads_ref.clone(),
-                        write_rx,
                     );
-                    let conn = Connection::new(key, write_tx, cancel);
+                    let conn = Connection::new(key, write_half, cancel);
                     return Ok(Some(std::mem::replace(existing, conn)));
                 }
             }
-            let (write_tx, write_rx) = mpsc::channel(100);
             let cipher = aes_gcm::AesGcm::new(GenericArray::from_slice(&key));
-            let cancel = new_encrypted_connection_task(
-                stream,
-                pubkey,
-                cipher,
-                self.reads_ref.clone(),
-                write_rx,
-            );
-            let conn = Connection::new(key, write_tx, cancel);
+            let (read_half, write_half) = stream.into_split();
+            let cancel =
+                new_encrypted_connection_task(read_half, pubkey, cipher, self.reads_ref.clone());
+            let conn = Connection::new(key, write_half, cancel);
             Ok(self.connections.insert(peer_addr, conn))
         }
     }
@@ -196,7 +168,7 @@ impl ConnectionPool {
     }
 
     pub fn is_full(&self) -> bool {
-        self.num_connections() == self.max_connections
+        self.num_connections() >= self.max_connections
     }
 
     pub fn get_conn_mut(&mut self, addr: &SocketAddr) -> Option<&mut Connection> {
