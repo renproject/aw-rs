@@ -45,9 +45,10 @@ async fn read_into_sender<R: AsyncReadExt + Unpin>(
         // FIXME(ross): Nonce reuse is catastrophic, so make sure to decide on how to pick the
         // nonce before using this in any important systems. We will set the nonce to a constant
         // for now for testing purposes.
-        let nonce = [0u8; 12];
+        let nonce = &buf[..12];
+        let enc = &buf[12..n];
         let nonce = GenericArray::from_slice(&nonce);
-        let dec = cipher.decrypt(nonce, &buf[..n]).expect("TODO");
+        let dec = cipher.decrypt(nonce, enc).expect("TODO");
 
         sender.send((pubkey, dec)).await.map_err(|_| ())?;
     }
@@ -56,11 +57,31 @@ async fn read_into_sender<R: AsyncReadExt + Unpin>(
     Err(())
 }
 
+pub struct EncryptedWriter {
+    writer: OwnedWriteHalf,
+    cipher: Aes256Gcm,
+}
+
+impl EncryptedWriter {
+    pub async fn write_all(&mut self, msg: &[u8]) -> Result<(), Error> {
+        // FIXME(ross): Nonce reuse is catastrophic, so make sure to decide on how to pick the
+        // nonce before using this in any important systems. We will set the nonce to a constant
+        // for now for testing purposes.
+        let nonce = rand::random::<[u8; 12]>();
+        let nonce = GenericArray::from_slice(&nonce);
+        let enc = self.cipher.encrypt(nonce, msg).map_err(Error::Encryption)?;
+
+        // TODO(ross): Is it better to put everything into one slice and write and call write_all
+        // on the full message?
+        self.writer.write_all(&nonce).await.map_err(Error::Write)?;
+        self.writer.write_all(&enc).await.map_err(Error::Write)
+    }
+}
+
 pub struct Connection {
-    write_half: OwnedWriteHalf,
+    write_half: Option<EncryptedWriter>,
     cancel: oneshot::Sender<()>,
     key: [u8; 32],
-    cipher: Aes256Gcm,
 }
 
 #[derive(Debug)]
@@ -69,28 +90,43 @@ pub enum Error {
     Write(io::Error),
     Encryption(aead::Error),
     Decryption(aead::Error),
+    ConnectionInUse,
 }
 
 impl Connection {
     pub fn new(key: [u8; 32], write_half: OwnedWriteHalf, cancel: oneshot::Sender<()>) -> Self {
         let cipher = aes_gcm::AesGcm::new(GenericArray::from_slice(&key));
+        let writer = EncryptedWriter {
+            writer: write_half,
+            cipher,
+        };
         Self {
-            write_half,
+            write_half: Some(writer),
             cancel,
             key,
-            cipher,
         }
     }
 
     pub async fn write(&mut self, msg: &[u8]) -> Result<(), Error> {
-        // FIXME(ross): Nonce reuse is catastrophic, so make sure to decide on how to pick the
-        // nonce before using this in any important systems. We will set the nonce to a constant
-        // for now for testing purposes.
-        let nonce = [0u8; 12];
-        let nonce = GenericArray::from_slice(&nonce);
-        let enc = self.cipher.encrypt(nonce, msg).map_err(Error::Encryption)?;
+        self.write_half
+            .as_mut()
+            .ok_or(Error::ConnectionInUse)?
+            .write_all(msg)
+            .await
+    }
 
-        self.write_half.write_all(&enc).await.map_err(Error::Write)
+    pub fn is_in_use(&self) -> bool {
+        self.write_half.is_none()
+    }
+
+    pub fn take_writer(&mut self) -> Option<EncryptedWriter> {
+        self.write_half.take()
+    }
+
+    pub fn give_back_writer(&mut self, writer: EncryptedWriter) {
+        // TODO(ross): Should we return an error/panic if there was already a writer in the
+        // connection? This case would probably represent violating an invariant.
+        self.write_half = Some(writer);
     }
 }
 
@@ -104,6 +140,7 @@ pub struct ConnectionPool {
 pub enum PoolError {
     TooManyConnections,
     PeerAddr(std::io::Error),
+    ConnectionInUse,
 }
 
 impl ConnectionPool {
@@ -135,6 +172,9 @@ impl ConnectionPool {
         } else {
             let peer_addr = stream.peer_addr().map_err(PeerAddr)?;
             if let Some(existing) = self.connections.get_mut(&peer_addr) {
+                if existing.is_in_use() {
+                    return Err(ConnectionInUse);
+                }
                 if existing.key > key {
                     let cipher = aes_gcm::AesGcm::new(GenericArray::from_slice(&key));
                     let (read_half, write_half) = stream.into_split();
@@ -159,6 +199,8 @@ impl ConnectionPool {
 
     pub fn remove_connection(&mut self, addr: &SocketAddr) {
         if let Some(conn) = self.connections.remove(addr) {
+            // We don't care if the receiver has been dropped, as this will mean that the task has
+            // been cancelled anyway.
             conn.cancel.send(()).ok();
         }
     }

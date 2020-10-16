@@ -1,7 +1,6 @@
 use aw_rs::handshake;
 use futures::executor;
-use parity_crypto::publickey::{Generator, Public, Random};
-use tokio::io::AsyncReadExt;
+use parity_crypto::publickey::{Generator, Random};
 use tokio::net::TcpStream;
 
 fn main() {
@@ -9,18 +8,11 @@ fn main() {
 
     let client_keypair = Random.generate();
     println!("client pubkey = {:x?}", client_keypair.public().as_bytes());
-    let mut stream = executor::block_on(TcpStream::connect(external_address)).unwrap();
-    let mut buf = [0u8; 64];
+    let stream = executor::block_on(TcpStream::connect(external_address)).unwrap();
 
-    executor::block_on(stream.read_exact(&mut buf)).expect("initial read");
-    let server_pubkey = Public::from_slice(&buf);
-
-    let res = executor::block_on(handshake::client_handshake(
-        stream,
-        &client_keypair,
-        &server_pubkey,
-    ));
+    let res = executor::block_on(handshake::client_handshake(stream, &client_keypair));
     assert!(res.is_ok());
-    let session_key = res.unwrap();
+    let (session_key, server_pubkey) = res.unwrap();
+    println!("server pubkey: {:x?}", server_pubkey);
     println!("session key: {:?}", session_key);
 }

@@ -1,30 +1,3 @@
-//! # Handshake protocol
-//!
-//! The following steps define the handshake protocol between a client and a server. When referring
-//! to public keys and elliptic curves, the curve being used is the secp256k1 curve. When referring
-//! to ECIES, the symmetric encryption used is AES-128 in CTR mode.
-//!
-//! 1. The client initiates the handshake by sending their public key to the server as plaintext.
-//!    The public key is encoded as `(x, y)` where `x` and `y` are the cartesian coordintes of the
-//!    curve point that represents the public key, and are individually represented as 32 byte
-//!    integers in big endian format. This first message is thus 64 bytes in length.
-//! 2. Upon receiving the public key from the client, the server picks a secret 32 byte value
-//!    `server_secret` randomly, and encrypts it using ECIES under the client's public key. This
-//!    encrypted secret is then sent to the client.
-//! 3. The client receives and decrypts `server_secret`. The client then picks a secret 32 byte
-//!    value `client_secret` randomly, and then encrypts `server_secret | client_secret` using
-//!    ECIES under the server's public key. This encrypted message is sent to the server.
-//! 4. The server decrypts the message from the client, which should be 64 bytes, and interprets
-//!    the first 32 bytes as `server_secret_echo`, and the last 32 bytes as `client_secret`.  The
-//!    server checks whether `server_secret_echo == server_secret`, and if this is not true the
-//!    handshake fails. The server then encrypts `client_secret` under the client's public key and
-//!    sends the encrypted message to the client. At this stage the server considers the handshake
-//!    to have completed successfully.
-//! 5. The client decrypts the 32 byte message from the server, which we will denote as
-//!    `client_secret_echo`. The client checks that `client_secret_echo == client_secret`, and if
-//!    this is not true the handshake fails. Otherwise the handshake protocol terminates. At this
-//!    stage the client considers the handshake to have completed successfully.
-
 use parity_crypto::publickey::{self, ecies, KeyPair, Public, Secret};
 use secp256k1::group::{fe::Fe, Ge};
 use std::io;
@@ -61,11 +34,15 @@ pub type Result<T> = std::result::Result<T, Error>;
 pub async fn client_handshake<RW: AsyncRead + AsyncWrite + Unpin>(
     mut conn: RW,
     client_keypair: &KeyPair,
-    server_pubkey: &Public,
-) -> Result<[u8; 32]> {
+) -> Result<([u8; 32], Public)> {
     use Error::*;
 
     let mut buf = [0u8; MAX_CLIENT_READ_SIZE];
+
+    // Read public key.
+    let read_buf = &mut buf[..PUBKEY_SIZE];
+    conn.read_exact(read_buf).await.map_err(Read)?;
+    let server_pubkey = read_pubkey(read_buf)?;
 
     // Write public key.
     conn.write_all(client_keypair.public().as_bytes())
@@ -83,7 +60,7 @@ pub async fn client_handshake<RW: AsyncRead + AsyncWrite + Unpin>(
 
     // Write encrypted server and client secret.
     secrets[SECRET_SIZE..].copy_from_slice(&rand::random::<[u8; 32]>());
-    let msg_enc = ecies::encrypt(server_pubkey, &[], &secrets).map_err(Encryption)?;
+    let msg_enc = ecies::encrypt(&server_pubkey, &[], &secrets).map_err(Encryption)?;
     conn.write_all(&msg_enc).await.map_err(Write)?;
 
     // Read encrypted client secret echo.
@@ -92,7 +69,7 @@ pub async fn client_handshake<RW: AsyncRead + AsyncWrite + Unpin>(
     conn.read_exact(read_buf).await.map_err(Read)?;
     client_read_and_check_secret_echo(read_buf, client_keypair.secret(), client_secret)?;
 
-    Ok(session_key(&client_secret, &server_secret))
+    Ok((session_key(&client_secret, &server_secret), server_pubkey))
 }
 
 fn client_read_server_secret(buf: &[u8], client_keypair_secret: &Secret) -> Result<Vec<u8>> {
@@ -121,10 +98,15 @@ pub async fn server_handshake<RW: AsyncRead + AsyncWrite + Unpin>(
 
     let mut buf = [0u8; MAX_SERVER_READ_SIZE];
 
+    // Write public key.
+    conn.write_all(server_keypair.public().as_bytes())
+        .await
+        .map_err(Write)?;
+
     // Read public key.
     let read_buf = &mut buf[..PUBKEY_SIZE];
     conn.read_exact(read_buf).await.map_err(Read)?;
-    let client_pubkey = server_read_client_pubkey(read_buf)?;
+    let client_pubkey = read_pubkey(read_buf)?;
 
     // Write encrypted server secret.
     let server_secret: [u8; 32] = rand::random();
@@ -146,7 +128,7 @@ pub async fn server_handshake<RW: AsyncRead + AsyncWrite + Unpin>(
     Ok((session_key(client_secret, &server_secret), client_pubkey))
 }
 
-fn server_read_client_pubkey(buf: &[u8]) -> Result<Public> {
+fn read_pubkey(buf: &[u8]) -> Result<Public> {
     // FIXME(ross): There should be a method in the secp256k1 package for creating a Ge from a byte
     // slice (and probably also more convenient constructors similar to this for the Fe type).
     let mut x = Fe::default();
@@ -208,24 +190,21 @@ mod tests {
         };
 
         let client_handle = std::thread::spawn(move || {
-            futures::executor::block_on(client_handshake(
-                client_rw,
-                &client_keypair_clone,
-                server_keypair_clone.public(),
-            ))
+            futures::executor::block_on(client_handshake(client_rw, &client_keypair_clone))
         });
         let server_handle = std::thread::spawn(move || {
-            futures::executor::block_on(server_handshake(server_rw, &server_keypair))
+            futures::executor::block_on(server_handshake(server_rw, &server_keypair_clone))
         });
 
         let client_res = client_handle.join().unwrap();
         let server_res = server_handle.join().unwrap();
 
         assert!(client_res.is_ok());
-        let client_session_key = client_res.unwrap();
+        let (client_session_key, server_pubkey_output) = client_res.unwrap();
         assert!(server_res.is_ok());
-        let (server_session_key, pubkey) = server_res.unwrap();
-        assert_eq!(&pubkey, client_keypair.public());
+        let (server_session_key, client_pubkey_output) = server_res.unwrap();
+        assert_eq!(&client_pubkey_output, client_keypair.public());
+        assert_eq!(&server_pubkey_output, server_keypair.public());
         assert_eq!(client_session_key, server_session_key);
     }
 
@@ -235,7 +214,7 @@ mod tests {
         for b in buf.iter_mut() {
             *b = rand::random();
         }
-        assert!(server_read_client_pubkey(&buf).is_err());
+        assert!(read_pubkey(&buf).is_err());
     }
 
     #[test]

@@ -23,17 +23,37 @@ impl ConnectionManager {
         Self { pool, table }
     }
 
-    pub fn send_to_all(&mut self, msg: &[u8]) -> Result<(), Error> {
-        for (_, conn) in self.pool.iter_mut() {
-            futures::executor::block_on(conn.write(&msg)).map_err(Error::Connection)?;
-        }
-        Ok(())
-    }
-
     pub fn add_peer(&mut self, pubkey: &Public, addr: SocketAddr) {
         self.table
             .add_peer(peer_table::id_from_pubkey(pubkey), addr);
     }
+}
+
+pub async fn send_to_all(
+    conn_manager: &SharedPtr<ConnectionManager>,
+    msg: &[u8],
+) -> Result<(), Error> {
+    let mut conn_manager_lock = match conn_manager.lock() {
+        Ok(lock) => lock,
+        Err(e) => e.into_inner(),
+    };
+    for (addr, conn) in conn_manager_lock.pool.iter_mut() {
+        if let Some(mut writer) = conn.take_writer() {
+            let conn_manager = conn_manager.clone();
+            let addr = addr.clone();
+            let msg = msg.to_owned();
+            tokio::spawn(async move {
+                writer.write_all(&msg).await.expect("TODO");
+                let mut conn_manager_lock = match conn_manager.lock() {
+                    Ok(lock) => lock,
+                    Err(e) => e.into_inner(),
+                };
+                let conn = conn_manager_lock.pool.get_conn_mut(&addr).expect("TODO");
+                conn.give_back_writer(writer);
+            });
+        }
+    }
+    Ok(())
 }
 
 pub struct ConnectionGuard<'a> {
@@ -59,6 +79,7 @@ pub enum Error {
     Connection(connection::Error),
     Pool(connection::PoolError),
     Tcp(tokio::io::Error),
+    PubKeyMismatch,
 }
 
 pub async fn get_connection_or_establish<'a>(
@@ -98,9 +119,15 @@ pub async fn get_connection_or_establish<'a>(
 
         match TcpStream::connect(addr).await {
             Ok(mut stream) => {
-                let key = handshake::client_handshake(&mut stream, keypair, peer_pubkey)
+                let (key, server_pubkey) = handshake::client_handshake(&mut stream, keypair)
                     .await
                     .map_err(Handshake)?;
+                if &server_pubkey != peer_pubkey {
+                    // FIXME(ross): This currently completes the entire handshake to find out that
+                    // the connection has the wrong pubkey. This can be detected much earlier in
+                    // the handshake, and so we should do that and abort early.
+                    return Err(PubKeyMismatch);
+                }
                 let mut conn_manager_lock = match conn_manager.lock() {
                     Ok(lock) => lock,
                     Err(e) => e.into_inner(),

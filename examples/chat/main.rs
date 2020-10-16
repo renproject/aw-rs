@@ -91,13 +91,13 @@ fn parse_input(
     }
 
     if input.starts_with("*") {
-        let mut conn_manager_lock = match conn_manager.lock() {
-            Ok(lock) => lock,
-            Err(e) => e.into_inner(),
-        };
-        conn_manager_lock
-            .send_to_all(&input[1..].as_bytes())
-            .expect("TODO");
+        let conn_manager = conn_manager.clone();
+        let msg = input[1..].as_bytes().to_owned();
+        tokio::spawn(async move {
+            conn_manager::send_to_all(&conn_manager, &msg)
+                .await
+                .expect("TODO")
+        });
         return Ok(());
     }
 
