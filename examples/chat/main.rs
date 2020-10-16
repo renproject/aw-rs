@@ -128,7 +128,7 @@ async fn parse_command(
                 .next()
                 .ok_or(InvalidArguments)
                 .and_then(|s| SocketAddr::from_str(s).map_err(|_| InvalidArguments))?;
-            conn_manager_lock.add_peer(&pubkey, addr);
+            conn_manager_lock.add_peer(pubkey, addr);
             Ok(())
         }
         "connect" => {

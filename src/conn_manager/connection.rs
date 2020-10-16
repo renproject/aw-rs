@@ -1,3 +1,4 @@
+use crate::conn_manager::peer_table;
 use aes_gcm::aead::{self, generic_array::GenericArray, Aead, NewAead};
 use aes_gcm::Aes256Gcm;
 use parity_crypto::publickey::Public;
@@ -35,21 +36,17 @@ async fn read_into_sender<R: AsyncReadExt + Unpin>(
     mut sender: mpsc::Sender<(Public, Vec<u8>)>,
 ) -> Result<(), ()> {
     // TODO(ross): What should the size of this buffer be?
+    let mut len_buf = [0u8; 4];
     let mut buf = [0u8; 1024];
-    while let Ok(n) = reader.read(&mut buf).await {
+    while let Ok(n) = reader.read_exact(&mut len_buf).await {
         if n == 0 {
             // Reading 0 bytes usually indicates EOF.
             return Ok(());
         }
-
-        // FIXME(ross): Nonce reuse is catastrophic, so make sure to decide on how to pick the
-        // nonce before using this in any important systems. We will set the nonce to a constant
-        // for now for testing purposes.
-        let nonce = &buf[..12];
-        let enc = &buf[12..n];
-        let nonce = GenericArray::from_slice(&nonce);
-        let dec = cipher.decrypt(nonce, enc).expect("TODO");
-
+        let l = u32::from_be_bytes(len_buf);
+        let enc_buf = &mut buf[..l as usize];
+        reader.read_exact(enc_buf).await.map_err(|_| todo!())?;
+        let dec = decrypt_aes_gcm(&cipher, enc_buf).expect("TODO");
         sender.send((pubkey, dec)).await.map_err(|_| ())?;
     }
     // TODO(ross): Should we try to keep reading from the connection after an error? Does it ever
@@ -64,18 +61,40 @@ pub struct EncryptedWriter {
 
 impl EncryptedWriter {
     pub async fn write_all(&mut self, msg: &[u8]) -> Result<(), Error> {
-        // FIXME(ross): Nonce reuse is catastrophic, so make sure to decide on how to pick the
-        // nonce before using this in any important systems. We will set the nonce to a constant
-        // for now for testing purposes.
-        let nonce = rand::random::<[u8; 12]>();
-        let nonce = GenericArray::from_slice(&nonce);
-        let enc = self.cipher.encrypt(nonce, msg).map_err(Error::Encryption)?;
-
-        // TODO(ross): Is it better to put everything into one slice and write and call write_all
-        // on the full message?
-        self.writer.write_all(&nonce).await.map_err(Error::Write)?;
-        self.writer.write_all(&enc).await.map_err(Error::Write)
+        let enc = encrypt_aes_gcm(&self.cipher, msg).map_err(Error::Encryption)?;
+        let l: u32 = enc.len() as u32;
+        let l_prefix = l.to_be_bytes();
+        let mut len_prefixed = Vec::with_capacity(l_prefix.len() + l as usize);
+        len_prefixed.extend_from_slice(&l_prefix);
+        len_prefixed.extend_from_slice(&enc);
+        self.writer
+            .write_all(&len_prefixed)
+            .await
+            .map_err(Error::Write)
     }
+}
+
+fn encrypt_aes_gcm(cipher: &Aes256Gcm, msg: &[u8]) -> Result<Vec<u8>, aead::Error> {
+    // TODO(ross): Currently the nonce is appended to the encrypted message. Double check that
+    // this is safe, and also look into whether it will be better to generate the nonce locally
+    // in a deterministic way so that both peers can determine the correct nonce locally.
+    let nonce = rand::random::<[u8; 12]>();
+    let nonce = GenericArray::from_slice(&nonce);
+    let enc = cipher.encrypt(nonce, msg)?;
+    let mut ret = Vec::with_capacity(nonce.len() + enc.len());
+    ret.extend_from_slice(&nonce);
+    ret.extend_from_slice(&enc);
+    Ok(ret)
+}
+
+fn decrypt_aes_gcm(cipher: &Aes256Gcm, msg: &[u8]) -> Result<Vec<u8>, aead::Error> {
+    // TODO(ross): Currently the nonce is appended to the encrypted message. Double check that
+    // this is safe, and also look into whether it will be better to generate the nonce locally
+    // in a deterministic way so that both peers can determine the correct nonce locally.
+    let nonce = &msg[..12];
+    let enc = &msg[12..];
+    let nonce = GenericArray::from_slice(&nonce);
+    cipher.decrypt(nonce, enc)
 }
 
 pub struct Connection {
@@ -130,6 +149,28 @@ impl Connection {
     }
 }
 
+pub async fn keep_alive(
+    stream: &mut TcpStream,
+    cipher: &Aes256Gcm,
+    own_pubkey: &Public,
+    peer_pubkey: &Public,
+    own_decision: bool,
+) -> Result<bool, Error> {
+    let own_id = peer_table::id_from_pubkey(own_pubkey);
+    let peer_id = peer_table::id_from_pubkey(peer_pubkey);
+    if own_id > peer_id {
+        let msg = encrypt_aes_gcm(cipher, &[1]).map_err(Error::Encryption)?;
+        stream.write_all(&msg).await.map_err(Error::Write)?;
+        Ok(own_decision)
+    } else {
+        let mut buf = [0u8; 16 + 12 + 1]; // TODO(ross): Pick this size in a better way.
+        stream.read_exact(&mut buf[..]).await.map_err(Error::Read)?;
+        let dec = decrypt_aes_gcm(cipher, &buf).map_err(Error::Decryption)?;
+        assert_eq!(dec.len(), 1);
+        Ok(dec[0] == 1)
+    }
+}
+
 pub struct ConnectionPool {
     max_connections: usize,
     connections: HashMap<SocketAddr, Connection>,
@@ -168,33 +209,20 @@ impl ConnectionPool {
         use PoolError::*;
 
         if self.connections.len() >= self.max_connections {
-            Err(TooManyConnections)
-        } else {
-            let peer_addr = stream.peer_addr().map_err(PeerAddr)?;
-            if let Some(existing) = self.connections.get_mut(&peer_addr) {
-                if existing.is_in_use() {
-                    return Err(ConnectionInUse);
-                }
-                if existing.key > key {
-                    let cipher = aes_gcm::AesGcm::new(GenericArray::from_slice(&key));
-                    let (read_half, write_half) = stream.into_split();
-                    let cancel = new_encrypted_connection_task(
-                        read_half,
-                        pubkey,
-                        cipher,
-                        self.reads_ref.clone(),
-                    );
-                    let conn = Connection::new(key, write_half, cancel);
-                    return Ok(Some(std::mem::replace(existing, conn)));
-                }
-            }
-            let cipher = aes_gcm::AesGcm::new(GenericArray::from_slice(&key));
-            let (read_half, write_half) = stream.into_split();
-            let cancel =
-                new_encrypted_connection_task(read_half, pubkey, cipher, self.reads_ref.clone());
-            let conn = Connection::new(key, write_half, cancel);
-            Ok(self.connections.insert(peer_addr, conn))
+            return Err(TooManyConnections);
         }
+        let peer_addr = stream.peer_addr().map_err(PeerAddr)?;
+        if let Some(existing) = self.connections.get_mut(&peer_addr) {
+            if existing.is_in_use() {
+                return Err(ConnectionInUse);
+            }
+        }
+        let cipher = aes_gcm::AesGcm::new(GenericArray::from_slice(&key));
+        let (read_half, write_half) = stream.into_split();
+        let cancel =
+            new_encrypted_connection_task(read_half, pubkey, cipher, self.reads_ref.clone());
+        let conn = Connection::new(key, write_half, cancel);
+        Ok(self.connections.insert(peer_addr, conn))
     }
 
     pub fn remove_connection(&mut self, addr: &SocketAddr) {
