@@ -74,6 +74,15 @@ impl EncryptedWriter {
     }
 }
 
+fn length_encode(msg: &[u8]) -> Vec<u8> {
+    let l: u32 = msg.len() as u32;
+    let l_prefix = l.to_be_bytes();
+    let mut len_prefixed = Vec::with_capacity(l_prefix.len() + l as usize);
+    len_prefixed.extend_from_slice(&l_prefix);
+    len_prefixed.extend_from_slice(&msg);
+    len_prefixed
+}
+
 fn encrypt_aes_gcm(cipher: &Aes256Gcm, msg: &[u8]) -> Result<Vec<u8>, aead::Error> {
     // TODO(ross): Currently the nonce is appended to the encrypted message. Double check that
     // this is safe, and also look into whether it will be better to generate the nonce locally
@@ -160,12 +169,22 @@ pub async fn keep_alive(
     let peer_id = peer_table::id_from_pubkey(peer_pubkey);
     if own_id > peer_id {
         let msg = encrypt_aes_gcm(cipher, &[1]).map_err(Error::Encryption)?;
-        stream.write_all(&msg).await.map_err(Error::Write)?;
+        stream
+            .write_all(&length_encode(&msg))
+            .await
+            .map_err(Error::Write)?;
         Ok(own_decision)
     } else {
         let mut buf = [0u8; 16 + 12 + 1]; // TODO(ross): Pick this size in a better way.
-        stream.read_exact(&mut buf[..]).await.map_err(Error::Read)?;
-        let dec = decrypt_aes_gcm(cipher, &buf).map_err(Error::Decryption)?;
+        let mut len_buf = [0u8; 4];
+        stream
+            .read_exact(&mut len_buf[..])
+            .await
+            .map_err(Error::Read)?;
+        let l = u32::from_be_bytes(len_buf);
+        let enc_buf = &mut buf[..l as usize];
+        stream.read_exact(enc_buf).await.map_err(Error::Read)?;
+        let dec = decrypt_aes_gcm(cipher, enc_buf).map_err(Error::Decryption)?;
         assert_eq!(dec.len(), 1);
         Ok(dec[0] == 1)
     }
