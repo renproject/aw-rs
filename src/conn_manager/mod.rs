@@ -1,10 +1,9 @@
 use crate::conn_manager::connection::Connection;
 use crate::handshake;
-use crate::util::SharedPtr;
+use crate::util::{self, SharedPtr};
 use aes_gcm::aead::{generic_array::GenericArray, NewAead};
 use parity_crypto::publickey::{KeyPair, Public};
 use std::net::{IpAddr, SocketAddr};
-use std::sync::MutexGuard;
 use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::stream::StreamExt;
@@ -34,44 +33,21 @@ pub async fn send_to_all(
     conn_manager: &SharedPtr<ConnectionManager>,
     msg: &[u8],
 ) -> Result<(), Error> {
-    let mut conn_manager_lock = match conn_manager.lock() {
-        Ok(lock) => lock,
-        Err(e) => e.into_inner(),
+    let writers = {
+        let conn_manager_lock = util::get_lock(conn_manager);
+        conn_manager_lock
+            .pool
+            .iter()
+            .map(|(_, conn)| conn.writer())
+            .collect::<Vec<_>>()
     };
-    for (addr, conn) in conn_manager_lock.pool.iter_mut() {
-        if let Some(mut writer) = conn.take_writer() {
-            let conn_manager = conn_manager.clone();
-            let addr = addr.clone();
-            let msg = msg.to_owned();
-            tokio::spawn(async move {
-                writer.write_all(&msg).await.expect("TODO");
-                let mut conn_manager_lock = match conn_manager.lock() {
-                    Ok(lock) => lock,
-                    Err(e) => e.into_inner(),
-                };
-                let conn = conn_manager_lock.pool.get_conn_mut(&addr).expect("TODO");
-                conn.give_back_writer(writer);
-            });
-        }
+    for mut writer in writers {
+        // TODO(ross): This fails when any of the sends didn't succeed, but in practice for a
+        // gossip style execution we will only care if at least a certain number of peers are
+        // reached.
+        writer.write(&msg).await.map_err(Error::Connection)?;
     }
     Ok(())
-}
-
-pub struct ConnectionGuard<'a> {
-    addr: SocketAddr,
-    guard: MutexGuard<'a, ConnectionManager>,
-}
-
-impl<'a> ConnectionGuard<'a> {
-    pub async fn write(&mut self, msg: &[u8]) -> Result<(), Error> {
-        self.guard
-            .pool
-            .get_conn_mut(&self.addr)
-            .expect("connection should exist")
-            .write(msg)
-            .await
-            .map_err(Error::Connection)
-    }
 }
 
 #[derive(Debug)]
@@ -83,12 +59,12 @@ pub enum Error {
     PubKeyMismatch,
 }
 
-pub async fn get_connection_or_establish<'a>(
+pub async fn establish_connection<'a>(
     conn_manager: &'a SharedPtr<ConnectionManager>,
     keypair: &KeyPair,
     peer_pubkey: &Public,
     addr: SocketAddr,
-) -> Result<ConnectionGuard<'a>, Error> {
+) -> Result<(), Error> {
     use Error::*;
 
     let mut backoff = Duration::from_secs(1);
@@ -101,10 +77,7 @@ pub async fn get_connection_or_establish<'a>(
             .table
             .connection_exists_for_peer(peer_pubkey)
         {
-            return Ok(ConnectionGuard {
-                addr,
-                guard: conn_manager_lock,
-            });
+            return Ok(());
         }
         if conn_manager_lock.pool.is_full() {
             // TODO(ross): Here we might need to consider the policy we take if the connection
@@ -131,22 +104,15 @@ pub async fn get_connection_or_establish<'a>(
                     // the handshake, and so we should do that and abort early.
                     return Err(PubKeyMismatch);
                 }
-                add_to_pool_with_reuse(
+                return add_to_pool_with_reuse(
                     conn_manager.clone(),
                     stream,
                     keypair.public(),
                     server_pubkey,
                     key,
                 )
-                .await?;
-                let conn_manager_lock = match conn_manager.lock() {
-                    Ok(lock) => lock,
-                    Err(e) => e.into_inner(),
-                };
-                return Ok(ConnectionGuard {
-                    addr,
-                    guard: conn_manager_lock,
-                });
+                .await
+                .map(drop);
             }
             Err(_e) => {
                 // TODO(ross): Should we log the error from failing to connect?

@@ -4,10 +4,24 @@ use core::{
 };
 use std::io::{self, ErrorKind, Read, Write};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use tokio::io::{AsyncRead, AsyncWrite};
 
 pub type SharedPtr<T> = Arc<Mutex<T>>;
+
+pub fn get_lock<'a, T>(mutex: &'a Mutex<T>) -> MutexGuard<'a, T> {
+    match mutex.lock() {
+        Ok(lock) => lock,
+        Err(e) => e.into_inner(),
+    }
+}
+
+pub fn mutex_into_inner<T>(mutex: Mutex<T>) -> T {
+    match mutex.into_inner() {
+        Ok(inner) => inner,
+        Err(e) => e.into_inner(),
+    }
+}
 
 pub struct ChannelRW {
     reader: Receiver<Vec<u8>>,

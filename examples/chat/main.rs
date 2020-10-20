@@ -39,12 +39,12 @@ async fn main() {
     let cm = conn_manager.clone();
     tokio::task::spawn_blocking(|| read_input(cm, keypair));
 
-    while let Some((sender, msg)) = reads.recv().await {
-        println!(
-            "{}: {}",
-            publickey::public_to_address(&sender),
-            std::str::from_utf8(&msg).unwrap()
-        );
+    while let Some((sender, msg_res)) = reads.recv().await {
+        let pubkey_addr = publickey::public_to_address(&sender);
+        match msg_res {
+            Ok(msg) => println!("{}: {}", pubkey_addr, std::str::from_utf8(&msg).unwrap()),
+            Err(e) => print!("{} error: {:?}", pubkey_addr, e),
+        }
     }
 
     listen_handle.await.unwrap().unwrap();
@@ -140,7 +140,7 @@ async fn parse_command(
                 .next()
                 .ok_or(InvalidArguments)
                 .and_then(|s| SocketAddr::from_str(s).map_err(|_| InvalidArguments))?;
-            conn_manager::get_connection_or_establish(conn_manager, keypair, &pubkey, addr)
+            conn_manager::establish_connection(conn_manager, keypair, &pubkey, addr)
                 .await
                 .map_err(|_| CommandFailed)?;
             Ok(())
@@ -148,12 +148,3 @@ async fn parse_command(
         _ => Err(InvalidCommand),
     }
 }
-
-/*
-fn lower_hex_char_to_nibble(c: char) -> Option<u8> {
-    if !c.is_ascii_hexdigit() || c.is_uppercase() {
-        return None;
-    }
-    Some(c as u8 - b'0')
-}
-*/

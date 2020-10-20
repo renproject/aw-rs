@@ -13,15 +13,18 @@ use tokio::sync::{mpsc, oneshot};
 
 pub fn new_encrypted_connection_task(
     read_half: OwnedReadHalf,
+    write_half: OwnedWriteHalf,
+    receiver: mpsc::Receiver<(Vec<u8>, oneshot::Sender<Result<(), Error>>)>,
+    sender: mpsc::Sender<(Public, Result<Vec<u8>, Error>)>,
     pubkey: Public,
     cipher: Aes256Gcm,
-    reads: mpsc::Sender<(Public, Vec<u8>)>,
 ) -> oneshot::Sender<()> {
     let (cancel_tx, cancel_rx) = oneshot::channel();
-    let read_fut = read_into_sender(pubkey, cipher.clone(), read_half, reads);
+    let read_fut = read_into_sender(pubkey, cipher.clone(), read_half, sender);
+    let write_fut = write_from_receiver(cipher.clone(), write_half, receiver);
     tokio::spawn(async {
         tokio::select! {
-            _ = read_fut => (),
+            _ = futures::future::join(read_fut, write_fut) => (),
             _ = cancel_rx => (),
         }
     });
@@ -33,10 +36,12 @@ async fn read_into_sender<R: AsyncReadExt + Unpin>(
     pubkey: Public,
     cipher: Aes256Gcm,
     mut reader: R,
-    mut sender: mpsc::Sender<(Public, Vec<u8>)>,
+    mut sender: mpsc::Sender<(Public, Result<Vec<u8>, Error>)>,
 ) -> Result<(), ()> {
-    // TODO(ross): What should the size of this buffer be?
     let mut len_buf = [0u8; 4];
+    // TODO(ross): What should the size of this buffer be?
+    // NOTE(ross): If a change to using a vector is used, make sure that there are checks on how
+    // much memory is allocated based on the length prefix sent by the peer.
     let mut buf = [0u8; 1024];
     while let Ok(n) = reader.read_exact(&mut len_buf).await {
         if n == 0 {
@@ -45,32 +50,44 @@ async fn read_into_sender<R: AsyncReadExt + Unpin>(
         }
         let l = u32::from_be_bytes(len_buf);
         let enc_buf = &mut buf[..l as usize];
-        reader.read_exact(enc_buf).await.map_err(|_| todo!())?;
-        let dec = decrypt_aes_gcm(&cipher, enc_buf).expect("TODO");
-        sender.send((pubkey, dec)).await.map_err(|_| ())?;
+        let res = reader.read_exact(enc_buf).await.map_err(Error::Read);
+        if let Some(e) = res.err() {
+            if sender.send((pubkey, Err(e))).await.is_err() {
+                // There is no one consuming the incoming messages, so we stop reading them.
+                return Ok(());
+            }
+        } else {
+            let dec = decrypt_aes_gcm(&cipher, enc_buf).map_err(Error::Decryption);
+            if sender.send((pubkey, dec)).await.is_err() {
+                // There is no one consuming the incoming messages, so we stop reading them.
+                return Ok(());
+            }
+        }
     }
     // TODO(ross): Should we try to keep reading from the connection after an error? Does it ever
     // make sense to do this?
     Err(())
 }
 
-pub struct EncryptedWriter {
-    writer: OwnedWriteHalf,
+async fn write_from_receiver(
     cipher: Aes256Gcm,
-}
-
-impl EncryptedWriter {
-    pub async fn write_all(&mut self, msg: &[u8]) -> Result<(), Error> {
-        let enc = encrypt_aes_gcm(&self.cipher, msg).map_err(Error::Encryption)?;
-        let l: u32 = enc.len() as u32;
-        let l_prefix = l.to_be_bytes();
-        let mut len_prefixed = Vec::with_capacity(l_prefix.len() + l as usize);
-        len_prefixed.extend_from_slice(&l_prefix);
-        len_prefixed.extend_from_slice(&enc);
-        self.writer
-            .write_all(&len_prefixed)
-            .await
-            .map_err(Error::Write)
+    mut write_half: OwnedWriteHalf,
+    mut receiver: mpsc::Receiver<(Vec<u8>, oneshot::Sender<Result<(), Error>>)>,
+) {
+    while let Some((msg, responder)) = receiver.recv().await {
+        match encrypt_aes_gcm(&cipher, &msg).map_err(Error::Encryption) {
+            Ok(enc) => {
+                let length_prefixed = length_encode(&enc);
+                let res = write_half
+                    .write_all(&length_prefixed)
+                    .await
+                    .map_err(Error::Write);
+                responder.send(res).ok();
+            }
+            Err(e) => {
+                responder.send(Err(e)).ok();
+            }
+        }
     }
 }
 
@@ -84,9 +101,9 @@ fn length_encode(msg: &[u8]) -> Vec<u8> {
 }
 
 fn encrypt_aes_gcm(cipher: &Aes256Gcm, msg: &[u8]) -> Result<Vec<u8>, aead::Error> {
-    // TODO(ross): Currently the nonce is appended to the encrypted message. Double check that
-    // this is safe, and also look into whether it will be better to generate the nonce locally
-    // in a deterministic way so that both peers can determine the correct nonce locally.
+    // TODO(ross): Currently the nonce is appended to the encrypted message. Double check that this
+    // is safe, and also look into whether it will be better to generate the nonce in a
+    // deterministic way so that both peers can determine the correct nonce locally.
     let nonce = rand::random::<[u8; 12]>();
     let nonce = GenericArray::from_slice(&nonce);
     let enc = cipher.encrypt(nonce, msg)?;
@@ -97,9 +114,9 @@ fn encrypt_aes_gcm(cipher: &Aes256Gcm, msg: &[u8]) -> Result<Vec<u8>, aead::Erro
 }
 
 fn decrypt_aes_gcm(cipher: &Aes256Gcm, msg: &[u8]) -> Result<Vec<u8>, aead::Error> {
-    // TODO(ross): Currently the nonce is appended to the encrypted message. Double check that
-    // this is safe, and also look into whether it will be better to generate the nonce locally
-    // in a deterministic way so that both peers can determine the correct nonce locally.
+    // TODO(ross): Currently the nonce is appended to the encrypted message. Double check that this
+    // is safe, and also look into whether it will be better to generate the nonce in a
+    // deterministic way so that both peers can determine the correct nonce locally.
     let nonce = &msg[..12];
     let enc = &msg[12..];
     let nonce = GenericArray::from_slice(&nonce);
@@ -107,54 +124,75 @@ fn decrypt_aes_gcm(cipher: &Aes256Gcm, msg: &[u8]) -> Result<Vec<u8>, aead::Erro
 }
 
 pub struct Connection {
-    write_half: Option<EncryptedWriter>,
+    writer: ConnectionWriter,
     cancel: oneshot::Sender<()>,
-    key: [u8; 32],
 }
 
 #[derive(Debug)]
 pub enum Error {
     Read(io::Error),
     Write(io::Error),
+    Receive,
+    Send,
     Encryption(aead::Error),
     Decryption(aead::Error),
-    ConnectionInUse,
 }
 
 impl Connection {
-    pub fn new(key: [u8; 32], write_half: OwnedWriteHalf, cancel: oneshot::Sender<()>) -> Self {
+    pub fn new(
+        key: [u8; 32],
+        pubkey: Public,
+        stream: TcpStream,
+        incoming_sender: mpsc::Sender<(Public, Result<Vec<u8>, Error>)>,
+    ) -> Self {
         let cipher = aes_gcm::AesGcm::new(GenericArray::from_slice(&key));
-        let writer = EncryptedWriter {
-            writer: write_half,
+        let (read_half, write_half) = stream.into_split();
+        // TODO(ross): Figure out what to do with channel buffer sizes.
+        let (outgoing_sender, outgoing_receiver) = mpsc::channel(100);
+        let cancel = new_encrypted_connection_task(
+            read_half,
+            write_half,
+            outgoing_receiver,
+            incoming_sender,
+            pubkey,
             cipher,
-        };
+        );
         Self {
-            write_half: Some(writer),
+            writer: ConnectionWriter::new(outgoing_sender),
             cancel,
-            key,
         }
     }
 
+    pub fn cancel(self) {
+        self.cancel.send(()).ok();
+    }
+
+    pub fn writer(&self) -> ConnectionWriter {
+        self.writer.clone()
+    }
+
     pub async fn write(&mut self, msg: &[u8]) -> Result<(), Error> {
-        self.write_half
-            .as_mut()
-            .ok_or(Error::ConnectionInUse)?
-            .write_all(msg)
+        self.writer.write(msg).await
+    }
+}
+
+#[derive(Clone)]
+pub struct ConnectionWriter {
+    writer: mpsc::Sender<(Vec<u8>, oneshot::Sender<Result<(), Error>>)>,
+}
+
+impl ConnectionWriter {
+    fn new(writer: mpsc::Sender<(Vec<u8>, oneshot::Sender<Result<(), Error>>)>) -> Self {
+        Self { writer }
+    }
+
+    pub async fn write(&mut self, msg: &[u8]) -> Result<(), Error> {
+        let (responder, response) = oneshot::channel();
+        self.writer
+            .send((msg.to_vec(), responder))
             .await
-    }
-
-    pub fn is_in_use(&self) -> bool {
-        self.write_half.is_none()
-    }
-
-    pub fn take_writer(&mut self) -> Option<EncryptedWriter> {
-        self.write_half.take()
-    }
-
-    pub fn give_back_writer(&mut self, writer: EncryptedWriter) {
-        // TODO(ross): Should we return an error/panic if there was already a writer in the
-        // connection? This case would probably represent violating an invariant.
-        self.write_half = Some(writer);
+            .map_err(|_| Error::Send)?;
+        response.await.map_err(|_| Error::Receive)?
     }
 }
 
@@ -193,21 +231,21 @@ pub async fn keep_alive(
 pub struct ConnectionPool {
     max_connections: usize,
     connections: HashMap<SocketAddr, Connection>,
-    reads_ref: mpsc::Sender<(Public, Vec<u8>)>,
+    reads_ref: mpsc::Sender<(Public, Result<Vec<u8>, Error>)>,
 }
 
 #[derive(Debug)]
 pub enum PoolError {
     TooManyConnections,
     PeerAddr(std::io::Error),
-    ConnectionInUse,
 }
 
 impl ConnectionPool {
     pub fn new_with_max_connections_allocated(
         max_connections: usize,
-    ) -> (Self, mpsc::Receiver<(Public, Vec<u8>)>) {
+    ) -> (Self, mpsc::Receiver<(Public, Result<Vec<u8>, Error>)>) {
         let connections = HashMap::with_capacity(max_connections);
+        // TODO(ross): Decide how to pick this buffer length.
         let (tx, rx) = mpsc::channel(100);
         (
             Self {
@@ -231,19 +269,13 @@ impl ConnectionPool {
             return Err(TooManyConnections);
         }
         let peer_addr = stream.peer_addr().map_err(PeerAddr)?;
-        if let Some(existing) = self.connections.get_mut(&peer_addr) {
-            if existing.is_in_use() {
-                return Err(ConnectionInUse);
-            }
-        }
-        let cipher = aes_gcm::AesGcm::new(GenericArray::from_slice(&key));
-        let (read_half, write_half) = stream.into_split();
-        let cancel =
-            new_encrypted_connection_task(read_half, pubkey, cipher, self.reads_ref.clone());
-        let conn = Connection::new(key, write_half, cancel);
+        let conn = Connection::new(key, pubkey, stream, self.reads_ref.clone());
         Ok(self.connections.insert(peer_addr, conn))
     }
 
+    // FIXME(ross): Currently this could be called while another task is writing to the connection,
+    // which may not necessarily cause a panic or anything but would probably be unexpected
+    // behvaviour.
     pub fn remove_connection(&mut self, addr: &SocketAddr) {
         if let Some(conn) = self.connections.remove(addr) {
             // We don't care if the receiver has been dropped, as this will mean that the task has
@@ -260,8 +292,8 @@ impl ConnectionPool {
         self.num_connections() >= self.max_connections
     }
 
-    pub fn get_conn_mut(&mut self, addr: &SocketAddr) -> Option<&mut Connection> {
-        self.connections.get_mut(addr)
+    pub fn iter(&self) -> impl Iterator<Item = (&SocketAddr, &Connection)> {
+        self.connections.iter()
     }
 
     pub fn iter_mut(&mut self) -> impl Iterator<Item = (&SocketAddr, &mut Connection)> {
