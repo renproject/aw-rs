@@ -13,4 +13,4 @@ parity-crypto = { version = "0.6.2", features = ["publickey"]}
 rand = "0.7.3"
 secp256k1 = { git = "https://github.com/renproject/secp256k1-rs" }
 sha2 = "0.9.1"
-tokio = { version = "0.2.22", features = ["blocking", "dns", "tcp", "io-std", "io-util", "rt-threaded", "macros", "time", "stream", "sync"] }
+tokio = { version = "0.2.22", features = ["blocking", "tcp", "dns", "io-std", "io-util", "rt-threaded", "macros", "time", "stream", "sync"] }

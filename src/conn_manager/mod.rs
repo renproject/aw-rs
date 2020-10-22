@@ -58,7 +58,7 @@ pub async fn send_to_all(
     conn_manager: &SharedPtr<ConnectionManager>,
     msg: &[u8],
 ) -> Result<(), Error> {
-    let writers = {
+    let mut writers = {
         let conn_manager_lock = util::get_lock(conn_manager);
         conn_manager_lock
             .pool
@@ -66,13 +66,12 @@ pub async fn send_to_all(
             .map(|(_, conn)| conn.writer())
             .collect::<Vec<_>>()
     };
-    for mut writer in writers {
-        // TODO(ross): This fails when any of the sends didn't succeed, but in practice for a
-        // gossip style execution we will only care if at least a certain number of peers are
-        // reached.
-        writer.write(&msg).await.map_err(Error::Connection)?;
-    }
-    Ok(())
+    // TODO(ross): This fails when any of the sends didn't succeed, but in practice for a gossip
+    // style execution we will only care if at least a certain number of peers are reached.
+    futures::future::try_join_all(writers.iter_mut().map(|writer| writer.write(&msg)))
+        .await
+        .map(drop)
+        .map_err(Error::Connection)
 }
 
 #[derive(Debug)]
@@ -247,5 +246,54 @@ async fn add_to_pool_with_reuse(
         println!("decided to drop!");
         // TODO(ross): Should we signal in the return value that the connection was dropped?
         Ok(None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use connection::ConnectionPool;
+    use parity_crypto::publickey::{Generator, Random};
+    use peer_table::PeerTable;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use std::sync::{Arc, Mutex};
+    use tokio::net::TcpStream;
+
+    #[tokio::test]
+    async fn existing_connection_is_used() {
+        std::thread::spawn(|| {
+            let listener = std::net::TcpListener::bind("0.0.0.0:23456").unwrap();
+            listener.accept().unwrap();
+            loop {}
+        });
+
+        let port = 23456;
+        let (mut pool, _) = ConnectionPool::new_with_max_connections_allocated(10);
+        let mut table = PeerTable::new();
+        let keypair = Random.generate();
+        let peer_pubkey = *Random.generate().public();
+        let key = rand::random();
+
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), port);
+        let existing_peer = table.add_peer(peer_pubkey, addr);
+        assert!(existing_peer.is_none());
+
+        let stream = std::net::TcpStream::connect(addr).unwrap();
+        let stream = TcpStream::from_std(stream).unwrap();
+        let existing_conn = pool.add_connection(stream, *keypair.public(), key).unwrap();
+        assert!(existing_conn.is_none());
+
+        let conn_manager = ConnectionManager::new(pool, table);
+        let conn_manager = Arc::new(Mutex::new(conn_manager));
+
+        futures::executor::block_on(establish_connection(
+            &conn_manager,
+            &keypair,
+            &peer_pubkey,
+            addr,
+        ))
+        .unwrap();
+        let conn_manager = util::get_lock(&conn_manager);
+        assert_eq!(conn_manager.pool.num_connections(), 1);
     }
 }

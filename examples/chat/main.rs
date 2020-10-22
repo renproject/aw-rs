@@ -4,12 +4,15 @@ use aw_rs::conn_manager::{self, ConnectionManager};
 use aw_rs::util::SharedPtr;
 use parity_crypto::publickey;
 use parity_crypto::publickey::{Generator, KeyPair, Public, Random};
-use std::collections::HashMap;
 use std::env;
 use std::io::BufRead;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
+
+mod alias;
+
+use alias::Aliases;
 
 #[tokio::main]
 async fn main() {
@@ -37,14 +40,13 @@ async fn main() {
         port,
     ));
 
-    let aliases = Arc::new(Mutex::new(Aliases::new()));
+    let aliases = Aliases::new();
     let aliases_clone = aliases.clone();
     let cm = conn_manager.clone();
     tokio::task::spawn_blocking(|| read_input(cm, aliases_clone, keypair));
 
     while let Some((sender, msg_res)) = reads.recv().await {
         let pubkey_addr = publickey::public_to_address(&sender);
-        let aliases = aw_rs::util::get_lock(&aliases);
         match (msg_res, aliases.get_by_pubkey(&sender)) {
             (Ok(msg), Some(name)) => println!("{}: {}", name, std::str::from_utf8(&msg).unwrap()),
             (Ok(msg), None) => println!("{}: {}", pubkey_addr, std::str::from_utf8(&msg).unwrap()),
@@ -56,11 +58,7 @@ async fn main() {
     listen_handle.await.unwrap().unwrap();
 }
 
-fn read_input(
-    conn_manager: SharedPtr<ConnectionManager>,
-    mut aliases: SharedPtr<Aliases>,
-    keypair: KeyPair,
-) {
+fn read_input(conn_manager: SharedPtr<ConnectionManager>, mut aliases: Aliases, keypair: KeyPair) {
     let stdin = std::io::stdin();
     let lock = stdin.lock();
     for line in lock.lines() {
@@ -81,7 +79,7 @@ enum ParseError {
 
 fn parse_input(
     conn_manager: &SharedPtr<ConnectionManager>,
-    aliases: &mut SharedPtr<Aliases>,
+    aliases: &mut Aliases,
     keypair: &KeyPair,
     input: &str,
 ) -> Result<(), ParseError> {
@@ -98,20 +96,20 @@ fn parse_input(
         let conn_manager = conn_manager.clone();
         let (peer, msg) = {
             let trimmed = &input[1..];
-            let aliases = aw_rs::util::get_lock(aliases);
             let i = trimmed.find(" ").ok_or(ParseError::InvalidInput)?;
             let (peer, msg) = (&trimmed[..i], &trimmed[i + 1..]);
             (
-                aliases.pubkey_from_maybe_alias(peer)?,
+                aliases
+                    .pubkey_from_maybe_alias(peer)
+                    .map_err(|_| ParseError::InvalidInput)?,
                 msg.as_bytes().to_owned(),
             )
         };
         tokio::spawn(async move {
-            if let Err(e) = conn_manager::try_send_peer(&conn_manager, &peer, &msg).await {
+            if let Err(_) = conn_manager::try_send_peer(&conn_manager, &peer, &msg).await {
                 println!(
-                    "could not reach peer {}: {:?}",
-                    publickey::public_to_address(&peer),
-                    e
+                    "error: not connected to peer {}",
+                    publickey::public_to_address(&peer)
                 );
             }
         });
@@ -138,7 +136,7 @@ fn parse_input(
 
 async fn parse_command(
     conn_manager: &SharedPtr<ConnectionManager>,
-    aliases: &mut SharedPtr<Aliases>,
+    aliases: &mut Aliases,
     keypair: &KeyPair,
     command: &str,
 ) -> Result<(), ParseError> {
@@ -154,9 +152,10 @@ async fn parse_command(
                 Err(e) => e.into_inner(),
             };
             let pubkey = {
-                let aliases = aw_rs::util::get_lock(aliases);
                 let pubkey = words.next().ok_or(InvalidArguments)?;
-                aliases.pubkey_from_maybe_alias(pubkey)?
+                aliases
+                    .pubkey_from_maybe_alias(pubkey)
+                    .map_err(|_| ParseError::InvalidInput)?
             };
             let addr = words
                 .next()
@@ -167,9 +166,10 @@ async fn parse_command(
         }
         "connect" => {
             let pubkey = {
-                let aliases = aw_rs::util::get_lock(aliases);
                 let pubkey = words.next().ok_or(InvalidArguments)?;
-                aliases.pubkey_from_maybe_alias(pubkey)?
+                aliases
+                    .pubkey_from_maybe_alias(pubkey)
+                    .map_err(|_| ParseError::InvalidInput)?
             };
             let addr = words
                 .next()
@@ -186,43 +186,9 @@ async fn parse_command(
                 .ok_or(InvalidArguments)
                 .and_then(|s| Public::from_str(s).map_err(|_| InvalidArguments))?;
             let name = words.next().ok_or(InvalidArguments).map(str::to_string)?;
-            let mut aliases = aw_rs::util::get_lock(aliases);
             let _ = aliases.insert(name, pubkey);
             Ok(())
         }
         _ => Err(InvalidCommand),
-    }
-}
-
-struct Aliases {
-    by_pubkey: HashMap<Public, String>,
-    by_name: HashMap<String, Public>,
-}
-
-impl Aliases {
-    fn new() -> Self {
-        let by_pubkey = HashMap::new();
-        let by_name = HashMap::new();
-        Self { by_pubkey, by_name }
-    }
-
-    fn insert(&mut self, name: String, pubkey: Public) {
-        let _ = self.by_name.insert(name.clone(), pubkey);
-        let _ = self.by_pubkey.insert(pubkey, name);
-    }
-
-    fn get_by_name(&self, name: &str) -> Option<&Public> {
-        self.by_name.get(name)
-    }
-
-    fn get_by_pubkey(&self, pubkey: &Public) -> Option<&String> {
-        self.by_pubkey.get(pubkey)
-    }
-
-    fn pubkey_from_maybe_alias(&self, name: &str) -> Result<Public, ParseError> {
-        match self.get_by_name(name) {
-            Some(pubkey) => Ok(pubkey.to_owned()),
-            None => Public::from_str(name).map_err(|_| ParseError::InvalidArguments),
-        }
     }
 }

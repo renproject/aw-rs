@@ -50,18 +50,14 @@ async fn read_into_sender<R: AsyncReadExt + Unpin>(
         }
         let l = u32::from_be_bytes(len_buf);
         let enc_buf = &mut buf[..l as usize];
-        let res = reader.read_exact(enc_buf).await.map_err(Error::Read);
-        if let Some(e) = res.err() {
-            if sender.send((pubkey, Err(e))).await.is_err() {
-                // There is no one consuming the incoming messages, so we stop reading them.
-                return Ok(());
-            }
-        } else {
-            let dec = decrypt_aes_gcm(&cipher, enc_buf).map_err(Error::Decryption);
-            if sender.send((pubkey, dec)).await.is_err() {
-                // There is no one consuming the incoming messages, so we stop reading them.
-                return Ok(());
-            }
+        let res = reader
+            .read_exact(enc_buf)
+            .await
+            .map_err(Error::Read)
+            .and_then(|_| decrypt_aes_gcm(&cipher, enc_buf).map_err(Error::Decryption));
+        if sender.send((pubkey, res)).await.is_err() {
+            // There is no one consuming the incoming messages, so we stop reading them.
+            return Ok(());
         }
     }
     // TODO(ross): Should we try to keep reading from the connection after an error? Does it ever
@@ -75,19 +71,17 @@ async fn write_from_receiver(
     mut receiver: mpsc::Receiver<(Vec<u8>, oneshot::Sender<Result<(), Error>>)>,
 ) {
     while let Some((msg, responder)) = receiver.recv().await {
-        match encrypt_aes_gcm(&cipher, &msg).map_err(Error::Encryption) {
+        let response = match encrypt_aes_gcm(&cipher, &msg).map_err(Error::Encryption) {
             Ok(enc) => {
                 let length_prefixed = length_encode(&enc);
-                let res = write_half
+                write_half
                     .write_all(&length_prefixed)
                     .await
-                    .map_err(Error::Write);
-                responder.send(res).ok();
+                    .map_err(Error::Write)
             }
-            Err(e) => {
-                responder.send(Err(e)).ok();
-            }
-        }
+            Err(e) => Err(e),
+        };
+        responder.send(response).ok();
     }
 }
 
@@ -277,11 +271,7 @@ impl ConnectionPool {
     // which may not necessarily cause a panic or anything but would probably be unexpected
     // behvaviour.
     pub fn remove_connection(&mut self, addr: &SocketAddr) {
-        if let Some(conn) = self.connections.remove(addr) {
-            // We don't care if the receiver has been dropped, as this will mean that the task has
-            // been cancelled anyway.
-            conn.cancel.send(()).ok();
-        }
+        self.connections.remove(addr).map(Connection::cancel);
     }
 
     pub fn num_connections(&self) -> usize {
