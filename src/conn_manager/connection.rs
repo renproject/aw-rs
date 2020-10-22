@@ -299,4 +299,8 @@ impl ConnectionPool {
     pub fn iter_mut(&mut self) -> impl Iterator<Item = (&SocketAddr, &mut Connection)> {
         self.connections.iter_mut()
     }
+
+    pub fn get_connection_mut(&mut self, addr: &SocketAddr) -> Option<&mut Connection> {
+        self.connections.get_mut(addr)
+    }
 }

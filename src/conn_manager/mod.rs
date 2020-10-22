@@ -29,6 +29,31 @@ impl ConnectionManager {
     }
 }
 
+pub async fn try_send_peer(
+    conn_manager: &SharedPtr<ConnectionManager>,
+    peer: &Public,
+    msg: &[u8],
+) -> Result<(), Error> {
+    let writer = {
+        let mut conn_manager_lock = util::get_lock(conn_manager);
+        conn_manager_lock
+            .table
+            .peer_addr(peer)
+            .cloned()
+            .and_then(|addr| {
+                conn_manager_lock
+                    .pool
+                    .get_connection_mut(&addr)
+                    .map(|conn| conn.writer())
+            })
+    };
+    if let Some(mut writer) = writer {
+        writer.write(msg).await.map_err(Error::Connection)
+    } else {
+        Err(Error::ConnectionDoesNotExist)
+    }
+}
+
 pub async fn send_to_all(
     conn_manager: &SharedPtr<ConnectionManager>,
     msg: &[u8],
@@ -57,6 +82,7 @@ pub enum Error {
     Pool(connection::PoolError),
     Tcp(tokio::io::Error),
     PubKeyMismatch,
+    ConnectionDoesNotExist,
 }
 
 pub async fn establish_connection<'a>(
