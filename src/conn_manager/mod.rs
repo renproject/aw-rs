@@ -190,8 +190,8 @@ pub async fn listen_for_peers(
                             }
                         }
                         Err(e) => {
-                            println!("[listener] handshake failed: {:?}", e);
                             // TODO(ross): Should we log failed handshake attempts?
+                            println!("[listener] handshake failed: {:?}", e);
                         }
                     }
                 });

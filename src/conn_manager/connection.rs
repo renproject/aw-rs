@@ -24,7 +24,8 @@ pub fn new_encrypted_connection_task(
     let write_fut = write_from_receiver(cipher.clone(), write_half, receiver);
     tokio::spawn(async {
         tokio::select! {
-            _ = futures::future::join(read_fut, write_fut) => (),
+            _ = read_fut => (),
+            _ = write_fut => (),
             _ = cancel_rx => (),
         }
     });
@@ -157,6 +158,10 @@ impl Connection {
         }
     }
 
+    pub fn is_closed(&self) -> bool {
+        self.cancel.is_closed()
+    }
+
     pub fn cancel(self) {
         self.cancel.send(()).ok();
     }
@@ -283,14 +288,37 @@ impl ConnectionPool {
     }
 
     pub fn iter(&self) -> impl Iterator<Item = (&SocketAddr, &Connection)> {
-        self.connections.iter()
+        self.connections
+            .iter()
+            .filter(|(_, conn)| !conn.is_closed())
     }
 
     pub fn iter_mut(&mut self) -> impl Iterator<Item = (&SocketAddr, &mut Connection)> {
+        self.clean_up_pool();
         self.connections.iter_mut()
     }
 
     pub fn get_connection_mut(&mut self, addr: &SocketAddr) -> Option<&mut Connection> {
+        self.clean_up_connection(addr);
         self.connections.get_mut(addr)
+    }
+
+    pub fn clean_up_connection(&mut self, addr: &SocketAddr) -> bool {
+        if self
+            .connections
+            .get(addr)
+            .map(Connection::is_closed)
+            .unwrap_or(false)
+        {
+            println!("removing dead connection from pool: {:?}", addr);
+            self.remove_connection(addr);
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn clean_up_pool(&mut self) {
+        self.connections.retain(|_, conn| !conn.is_closed());
     }
 }
