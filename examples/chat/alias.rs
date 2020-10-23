@@ -16,11 +16,6 @@ impl Aliases {
         lock.insert(name, pubkey)
     }
 
-    pub fn get_by_name(&self, name: &str) -> Option<Public> {
-        let lock = util::get_lock(self.0.as_ref());
-        lock.get_by_name(name).cloned()
-    }
-
     pub fn get_by_pubkey(&self, pubkey: &Public) -> Option<String> {
         let lock = util::get_lock(self.0.as_ref());
         lock.get_by_pubkey(pubkey).cloned()

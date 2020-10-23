@@ -22,6 +22,14 @@ impl PeerTable {
         self.0.contains_key(pubkey)
     }
 
+    pub fn num_peers(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn peers(&self) -> impl Iterator<Item = (&Public, &SocketAddr)> {
+        self.0.iter()
+    }
+
     pub fn add_peer(&mut self, pubkey: Public, addr: SocketAddr) -> Option<SocketAddr> {
         self.0.insert(pubkey, addr)
     }

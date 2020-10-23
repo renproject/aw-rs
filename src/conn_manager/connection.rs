@@ -310,7 +310,6 @@ impl ConnectionPool {
             .map(Connection::is_closed)
             .unwrap_or(false)
         {
-            println!("removing dead connection from pool: {:?}", addr);
             self.remove_connection(addr);
             true
         } else {

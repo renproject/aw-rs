@@ -27,6 +27,14 @@ impl ConnectionManager {
     pub fn add_peer(&mut self, pubkey: Public, addr: SocketAddr) {
         self.table.add_peer(pubkey, addr);
     }
+
+    pub fn num_peers(&self) -> usize {
+        self.table.num_peers()
+    }
+
+    pub fn peers(&self) -> impl Iterator<Item = (&Public, &SocketAddr)> {
+        self.table.peers()
+    }
 }
 
 pub async fn try_send_peer(
@@ -105,8 +113,8 @@ pub async fn establish_connection<'a>(
             return Ok(());
         }
         if conn_manager_lock.pool.is_full() {
-            // TODO(ross): Here we might need to consider the policy we take if the connection
-            // pool is full. For example, we might want to be aggressive about establishing the
+            // TODO(ross): Here we might need to consider the policy we take if the connection pool
+            // is full. For example, we might want to be aggressive about establishing the
             // connection and remove an old connection so that the new one can fit.
             todo!()
         }
@@ -165,10 +173,10 @@ pub async fn listen_for_peers(
                 let keypair = keypair.clone();
                 let conn_manager = conn_manager.clone();
                 tokio::spawn(async move {
-                    println!("[listener] incoming connection, starting handshake");
+                    // println!("[listener] incoming connection, starting handshake");
                     match handshake::server_handshake(&mut stream, &keypair).await {
                         Ok((key, client_pubkey)) => {
-                            println!("[listener] successful handhsake");
+                            // println!("[listener] successful handhsake");
                             match add_to_pool_with_reuse(
                                 conn_manager,
                                 stream,
@@ -189,9 +197,9 @@ pub async fn listen_for_peers(
                                 }
                             }
                         }
-                        Err(e) => {
+                        Err(_e) => {
                             // TODO(ross): Should we log failed handshake attempts?
-                            println!("[listener] handshake failed: {:?}", e);
+                            // println!("[listener] handshake failed: {:?}", e);
                         }
                     }
                 });
@@ -231,11 +239,11 @@ async fn add_to_pool_with_reuse(
         Err(e) => e.into_inner(),
     };
     if keep_alive {
-        println!("decided to keep alive!");
-        println!(
+        // println!("decided to keep alive!");
+        /* println!(
             "adding to pool: {}",
             parity_crypto::publickey::public_to_address(&peer_pubkey),
-        );
+        ); */
         let addr = stream.peer_addr().expect("TODO");
         conn_manager_lock.table.add_peer(peer_pubkey, addr);
         conn_manager_lock
@@ -243,7 +251,7 @@ async fn add_to_pool_with_reuse(
             .add_connection(stream, peer_pubkey, key)
             .map_err(Error::Pool)
     } else {
-        println!("decided to drop!");
+        // println!("decided to drop!");
         // TODO(ross): Should we signal in the return value that the connection was dropped?
         Ok(None)
     }
