@@ -270,12 +270,12 @@ mod tests {
     #[tokio::test]
     async fn existing_connection_is_used() {
         std::thread::spawn(|| {
-            let listener = std::net::TcpListener::bind("0.0.0.0:23456").unwrap();
+            let listener = std::net::TcpListener::bind("0.0.0.0:12345").unwrap();
             listener.accept().unwrap();
             loop {}
         });
 
-        let port = 23456;
+        let port = 12345;
         let (mut pool, _) = ConnectionPool::new_with_max_connections_allocated(10);
         let mut table = PeerTable::new();
         let keypair = Random.generate();
