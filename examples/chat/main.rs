@@ -120,7 +120,15 @@ async fn main() {
     let keypair = Random.generate();
 
     let max_connections = 10;
-    let (pool, mut reads) = ConnectionPool::new_with_max_connections_allocated(max_connections);
+    let max_header_len = 512;
+    let max_data_len = 2048;
+    let buffer_size = 100;
+    let (pool, mut reads) = ConnectionPool::new_with_max_connections_allocated(
+        max_connections,
+        max_header_len,
+        max_data_len,
+        buffer_size,
+    );
     let table = PeerTable::new();
     let conn_manager = Arc::new(Mutex::new(ConnectionManager::new(pool, table)));
 
@@ -137,13 +145,11 @@ async fn main() {
     let screen_clone = screen.clone();
     tokio::task::spawn_blocking(move || read_input(cm, aliases_clone, keypair, screen_clone));
 
-    while let Some((sender, msg_res)) = reads.recv().await {
+    while let Some((sender, msg)) = reads.recv().await {
         let pubkey_addr = publickey::public_to_address(&sender);
-        let string = match (msg_res, aliases.get_by_pubkey(&sender)) {
-            (Ok(msg), Some(name)) => format!("{}: {}", name, std::str::from_utf8(&msg).unwrap()),
-            (Ok(msg), None) => format!("{}: {}", pubkey_addr, std::str::from_utf8(&msg).unwrap()),
-            (Err(e), Some(name)) => format!("{} error: {:?}", name, e),
-            (Err(e), None) => format!("{} error: {:?}", pubkey_addr, e),
+        let string = match aliases.get_by_pubkey(&sender) {
+            Some(name) => format!("{}: {}", name, std::str::from_utf8(&msg).unwrap()),
+            None => format!("{}: {}", pubkey_addr, std::str::from_utf8(&msg).unwrap()),
         };
         screen.add_output_line(string);
         screen.print_screen();
