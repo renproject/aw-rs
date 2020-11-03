@@ -1,5 +1,5 @@
 [package]
-name = "aw-rs"
+name = "aw"
 version = "0.1.0"
 authors = ["ross <ross.pure@gmail.com>"]
 edition = "2018"

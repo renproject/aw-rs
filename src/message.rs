@@ -8,6 +8,10 @@ pub type Version = u16;
 
 pub const V1: Version = 1;
 
+pub const VAR_PUSH: u16 = 0;
+pub const VAR_PULL: u16 = 1;
+pub const VAR_SYN: u16 = 2;
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Variant {
     Push,
@@ -19,9 +23,9 @@ impl From<Variant> for u16 {
     fn from(var: Variant) -> Self {
         use Variant::*;
         match var {
-            Push => 0,
-            Pull => 1,
-            Syn => 2,
+            Push => VAR_PUSH,
+            Pull => VAR_PULL,
+            Syn => VAR_SYN,
         }
     }
 }
@@ -45,20 +49,26 @@ impl TryFrom<u16> for Variant {
     fn try_from(n: u16) -> Result<Self, Self::Error> {
         use Variant::*;
         match n {
-            0 => Ok(Push),
-            1 => Ok(Pull),
-            2 => Ok(Syn),
+            VAR_PUSH => Ok(Push),
+            VAR_PULL => Ok(Pull),
+            VAR_SYN => Ok(Syn),
             _ => Err(U16TryFromVariantError::InvalidVariant),
         }
     }
 }
 
 #[derive(Debug, Clone)]
-pub struct Message {
+pub enum Message {
+    Header(Header),
+    Syn(Vec<u8>, Vec<u8>),
+}
+
+#[derive(Debug, Clone)]
+pub struct Header {
     pub version: Version,
     pub variant: Variant,
     pub to: PeerID,
-    pub data: Vec<u8>,
+    pub key: Vec<u8>,
 }
 
 #[derive(Debug)]
@@ -69,13 +79,13 @@ pub enum Error {
     InvalidTo,
 }
 
-impl Message {
-    pub fn new(version: Version, variant: Variant, to: PeerID, data: Vec<u8>) -> Self {
+impl Header {
+    pub fn new(version: Version, variant: Variant, to: PeerID, key: Vec<u8>) -> Self {
         Self {
             version,
             variant,
             to,
-            data,
+            key,
         }
     }
 
@@ -88,7 +98,7 @@ impl Message {
         let (version_bytes, data) = data.split_at(2);
         let version: Version = u16::from_be_bytes([version_bytes[0], version_bytes[1]]);
         match version {
-            0 => {
+            V1 => {
                 if data.len() < 2 {
                     return Err(InvalidVariant);
                 }
@@ -106,7 +116,7 @@ impl Message {
                     version,
                     variant,
                     to,
-                    data: vec.split_off(36),
+                    key: vec.split_off(36),
                 })
             }
             _ => Err(UnsupportedVersion),
@@ -119,12 +129,12 @@ impl Message {
             version,
             variant,
             to,
-            data,
+            key,
         } = self;
         bytes.extend_from_slice(&version.to_be_bytes());
         bytes.extend_from_slice(&u16::from(variant).to_be_bytes());
         bytes.extend_from_slice(&to);
-        bytes.extend_from_slice(data.as_slice());
+        bytes.extend_from_slice(key.as_slice());
         bytes
     }
 }

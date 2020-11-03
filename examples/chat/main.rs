@@ -1,15 +1,18 @@
-use aw_rs::conn_manager::connection::ConnectionPool;
-use aw_rs::conn_manager::peer_table::{self, PeerTable};
-use aw_rs::conn_manager::{self, ConnectionManager};
-use aw_rs::util;
-use aw_rs::util::SharedPtr;
+use aw::conn_manager::connection::ConnectionPool;
+use aw::conn_manager::peer_table::{self, PeerTable};
+use aw::conn_manager::{self, ConnectionManager};
+use aw::gossip::{self, Decider};
+use aw::message::Header;
+use aw::util;
 use parity_crypto::publickey;
 use parity_crypto::publickey::{Generator, KeyPair, Public, Random};
+use sha2::{Digest, Sha256};
 use std::env;
 use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
+use tokio::sync::mpsc;
 
 mod alias;
 
@@ -118,19 +121,40 @@ async fn main() {
     flush();
 
     let keypair = Random.generate();
+    let own_pubkey = *keypair.public();
 
     let max_connections = 10;
     let max_header_len = 512;
     let max_data_len = 2048;
     let buffer_size = 100;
+    let alpha = 3;
+    let decider = Decider::new();
+    let will_pull = move |header: &Header| header.to == peer_table::id_from_pubkey(&own_pubkey);
     let (pool, mut reads) = ConnectionPool::new_with_max_connections_allocated(
         max_connections,
         max_header_len,
         max_data_len,
         buffer_size,
+        decider.clone(),
     );
     let table = PeerTable::new();
     let conn_manager = Arc::new(Mutex::new(ConnectionManager::new(pool, table)));
+    let (gossip_fut, mut cm_in, gossip_in, mut gossip_out) = gossip::gossip_task(
+        buffer_size,
+        alpha,
+        will_pull,
+        &decider,
+        conn_manager.clone(),
+    );
+    let cm_to_gossiper_fut = async move {
+        while let Some(msg) = reads.recv().await {
+            if cm_in.send(msg).await.is_err() {
+                break;
+            }
+        }
+    };
+
+    let gossip_handle = tokio::spawn(futures::future::join(gossip_fut, cm_to_gossiper_fut));
 
     let listen_handle = tokio::spawn(conn_manager::listen_for_peers(
         conn_manager.clone(),
@@ -141,11 +165,18 @@ async fn main() {
 
     let aliases = Aliases::new();
     let aliases_clone = aliases.clone();
-    let cm = conn_manager.clone();
     let screen_clone = screen.clone();
-    tokio::task::spawn_blocking(move || read_input(cm, aliases_clone, keypair, screen_clone));
+    tokio::task::spawn_blocking(move || {
+        read_input(
+            &conn_manager,
+            gossip_in,
+            aliases_clone,
+            keypair,
+            screen_clone,
+        )
+    });
 
-    while let Some((sender, msg)) = reads.recv().await {
+    while let Some((sender, msg)) = gossip_out.recv().await {
         let pubkey_addr = publickey::public_to_address(&sender);
         let string = match aliases.get_by_pubkey(&sender) {
             Some(name) => format!("{}: {}", name, std::str::from_utf8(&msg).unwrap()),
@@ -156,10 +187,12 @@ async fn main() {
     }
 
     listen_handle.await.unwrap().unwrap();
+    gossip_handle.await.unwrap().0.unwrap();
 }
 
 fn read_input(
-    conn_manager: SharedPtr<ConnectionManager>,
+    conn_manager: &Arc<Mutex<ConnectionManager<Decider>>>,
+    mut sender: mpsc::Sender<(Public, Vec<u8>, Vec<u8>)>,
     mut aliases: Aliases,
     keypair: KeyPair,
     mut screen: ScreenText,
@@ -176,7 +209,13 @@ fn read_input(
         let mut buf = [0u8; 1];
         lock.read_exact(&mut buf).unwrap();
         if buf[0] as char == '\n' {
-            let output = match parse_input(&conn_manager, &mut aliases, &keypair, &screen.input()) {
+            let output = match parse_input(
+                conn_manager,
+                &mut sender,
+                &mut aliases,
+                &keypair,
+                &screen.input(),
+            ) {
                 Ok(s) => s,
                 Err(e) => format!("{:?}", e),
             };
@@ -200,7 +239,8 @@ enum ParseError {
 }
 
 fn parse_input(
-    conn_manager: &SharedPtr<ConnectionManager>,
+    conn_manager: &Arc<Mutex<ConnectionManager<Decider>>>,
+    sender: &mut mpsc::Sender<(Public, Vec<u8>, Vec<u8>)>,
     aliases: &mut Aliases,
     keypair: &KeyPair,
     input: &str,
@@ -215,7 +255,6 @@ fn parse_input(
     }
 
     if input.starts_with("@") {
-        let conn_manager = conn_manager.clone();
         let (peer, msg) = {
             let trimmed = &input[1..];
             let i = trimmed.find(" ").ok_or(ParseError::InvalidInput)?;
@@ -228,14 +267,12 @@ fn parse_input(
             )
         };
         let msg_string = std::str::from_utf8(&msg).unwrap().to_owned();
-        tokio::spawn(async move {
-            if let Err(_) = conn_manager::try_send_peer(&conn_manager, &peer, &msg).await {
-                println!(
-                    "error: not connected to peer {}",
-                    publickey::public_to_address(&peer)
-                );
-            }
-        });
+        if let Err(_) = sender.try_send((peer, key(&msg).to_vec(), msg)) {
+            println!(
+                "error: not connected to peer {}",
+                publickey::public_to_address(&peer)
+            );
+        }
         return Ok(format!(">{}", msg_string));
     }
 
@@ -244,7 +281,8 @@ fn parse_input(
     }
 
     if input.starts_with("*") {
-        let conn_manager = conn_manager.clone();
+        unimplemented!()
+        /*
         let msg = input[1..].as_bytes().to_owned();
         let msg_string = std::str::from_utf8(&msg).unwrap().to_owned();
         tokio::spawn(async move {
@@ -253,13 +291,14 @@ fn parse_input(
                 .expect("TODO")
         });
         return Ok(format!(">{}", msg_string));
+        */
     }
 
     Err(ParseError::InvalidInput)
 }
 
 async fn parse_command(
-    conn_manager: &SharedPtr<ConnectionManager>,
+    conn_manager: &Arc<Mutex<ConnectionManager<Decider>>>,
     aliases: &mut Aliases,
     keypair: &KeyPair,
     command: &str,
@@ -354,4 +393,10 @@ async fn parse_command(
         }
         _ => Err(InvalidCommand),
     }
+}
+
+fn key(msg: &[u8]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(msg);
+    hasher.finalize().into()
 }

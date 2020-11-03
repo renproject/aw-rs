@@ -36,6 +36,10 @@ impl<T> ConnectionManager<T> {
     pub fn peers(&self) -> impl Iterator<Item = (&Public, &SocketAddr)> {
         self.table.peers()
     }
+
+    pub fn random_peer_subset(&self, n: usize) -> Vec<Public> {
+        self.table.random_peer_subset(n)
+    }
 }
 
 pub async fn try_send_peer<T: SynDecider + Clone + Send + 'static>(
@@ -94,14 +98,18 @@ pub enum Error {
     ConnectionDoesNotExist,
 }
 
+impl From<handshake::Error> for Error {
+    fn from(e: handshake::Error) -> Error {
+        Error::Handshake(e)
+    }
+}
+
 pub async fn establish_connection<'a, T: SynDecider + Clone + Send + 'static>(
     conn_manager: &'a SharedPtr<ConnectionManager<T>>,
     keypair: &KeyPair,
     peer_pubkey: &Public,
     addr: SocketAddr,
 ) -> Result<(), Error> {
-    use Error::*;
-
     let mut backoff = Duration::from_secs(1);
     loop {
         {
@@ -119,15 +127,8 @@ pub async fn establish_connection<'a, T: SynDecider + Clone + Send + 'static>(
 
         match TcpStream::connect(addr).await {
             Ok(mut stream) => {
-                let (key, server_pubkey) = handshake::client_handshake(&mut stream, keypair)
-                    .await
-                    .map_err(Handshake)?;
-                if &server_pubkey != peer_pubkey {
-                    // FIXME(ross): This currently completes the entire handshake to find out that
-                    // the connection has the wrong pubkey. This can be detected much earlier in
-                    // the handshake, and so we should do that and abort early.
-                    return Err(PubKeyMismatch);
-                }
+                let (key, server_pubkey) =
+                    handshake::client_handshake(&mut stream, keypair, Some(peer_pubkey)).await?;
                 return add_to_pool_with_reuse(
                     conn_manager.clone(),
                     stream,
@@ -139,7 +140,6 @@ pub async fn establish_connection<'a, T: SynDecider + Clone + Send + 'static>(
                 .map(drop);
             }
             Err(_e) => {
-                // TODO(ross): Should we log the error from failing to connect?
                 tokio::time::delay_for(backoff).await;
                 backoff = backoff.mul_f32(1.6);
             }

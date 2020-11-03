@@ -1,4 +1,4 @@
-use aw_rs::util;
+use aw::util;
 use parity_crypto::publickey::Public;
 use std::collections::HashMap;
 use std::str::FromStr;

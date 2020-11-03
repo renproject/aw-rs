@@ -1,4 +1,4 @@
-use aw_rs::handshake;
+use aw::handshake;
 use futures::executor;
 use parity_crypto::publickey::{Generator, Random};
 use tokio::io::AsyncWriteExt;

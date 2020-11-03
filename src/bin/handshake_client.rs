@@ -1,4 +1,4 @@
-use aw_rs::handshake;
+use aw::handshake;
 use futures::executor;
 use parity_crypto::publickey::{Generator, Random};
 use tokio::net::TcpStream;
@@ -10,7 +10,7 @@ fn main() {
     println!("client pubkey = {:x?}", client_keypair.public().as_bytes());
     let stream = executor::block_on(TcpStream::connect(external_address)).unwrap();
 
-    let res = executor::block_on(handshake::client_handshake(stream, &client_keypair));
+    let res = executor::block_on(handshake::client_handshake(stream, &client_keypair, None));
     assert!(res.is_ok());
     let (session_key, server_pubkey) = res.unwrap();
     println!("server pubkey: {:x?}", server_pubkey);

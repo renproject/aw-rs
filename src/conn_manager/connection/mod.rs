@@ -1,11 +1,12 @@
 use crate::conn_manager::peer_table;
-use crate::message::{self, Message, Variant};
+use crate::message::{self, Header, Message, Variant};
 use aes_gcm::aead::{self, generic_array::GenericArray, NewAead};
 use aes_gcm::Aes256Gcm;
 use parity_crypto::publickey::Public;
 use std::collections::HashMap;
-use std::convert::TryFrom;
+use std::convert::TryInto;
 use std::net::SocketAddr;
+use std::num::TryFromIntError;
 use tokio::io::{self, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{
     tcp::{OwnedReadHalf, OwnedWriteHalf},
@@ -32,7 +33,7 @@ pub fn new_encrypted_connection_task<T: SynDecider + Send + 'static>(
     decider: T,
 ) -> (
     oneshot::Sender<()>,
-    mpsc::Receiver<(Public, Vec<u8>)>,
+    mpsc::Receiver<(Public, Message)>,
     mpsc::Sender<SendPair>,
 ) {
     let (cancel_tx, cancel_rx) = oneshot::channel();
@@ -61,32 +62,10 @@ pub fn new_encrypted_connection_task<T: SynDecider + Send + 'static>(
 
 #[derive(Debug)]
 enum ReadFutError {
-    Read(io::Error),
-    Decryption(aead::Error),
-    InvalidLen(<usize as TryFrom<u32>>::Error),
     Parse(message::Error),
-    Send(SendError<(Public, Vec<u8>)>),
-    HeaderTooBig,
-    DataTooBig,
+    Send(SendError<(Public, Message)>),
+    Decode(DecodeError),
     UnrequestedSyn,
-}
-
-impl From<io::Error> for ReadFutError {
-    fn from(e: io::Error) -> Self {
-        ReadFutError::Read(e)
-    }
-}
-
-impl From<aead::Error> for ReadFutError {
-    fn from(e: aead::Error) -> Self {
-        ReadFutError::Decryption(e)
-    }
-}
-
-impl From<std::num::TryFromIntError> for ReadFutError {
-    fn from(e: std::num::TryFromIntError) -> Self {
-        ReadFutError::InvalidLen(e)
-    }
 }
 
 impl From<message::Error> for ReadFutError {
@@ -95,9 +74,15 @@ impl From<message::Error> for ReadFutError {
     }
 }
 
-impl From<SendError<(Public, Vec<u8>)>> for ReadFutError {
-    fn from(e: SendError<(Public, Vec<u8>)>) -> Self {
+impl From<SendError<(Public, Message)>> for ReadFutError {
+    fn from(e: SendError<(Public, Message)>) -> Self {
         ReadFutError::Send(e)
+    }
+}
+
+impl From<DecodeError> for ReadFutError {
+    fn from(e: DecodeError) -> Self {
+        ReadFutError::Decode(e)
     }
 }
 
@@ -107,39 +92,100 @@ async fn read_into_sender<R: AsyncReadExt + Unpin, T: SynDecider>(
     max_header_len: usize,
     max_data_len: usize,
     mut reader: R,
-    mut sender: mpsc::Sender<(Public, Vec<u8>)>,
+    mut sender: mpsc::Sender<(Public, Message)>,
     mut decider: T,
 ) -> Result<(), ReadFutError> {
     use ReadFutError::*;
     // TODO(ross): What should the size of this buffer be?
     let mut buf = [0u8; 1024];
     loop {
-        let l = reader.read_u32().await?;
-        let l = usize::try_from(l)?;
-        if l > max_header_len {
-            // TODO(ross): Should we return more error information?
-            return Err(HeaderTooBig);
-        }
-        let enc_buf = &mut buf[..l];
-        let _ = reader.read_exact(enc_buf).await?;
-        let res = encode::decrypt_aes256gcm(&cipher, enc_buf)?;
-        let header = Message::from_bytes(res)?;
-        if header.variant == Variant::Syn {
-            if !decider.accept_syn(&header) {
+        let header_bytes =
+            decode_aes_len_encoded(&mut reader, &mut buf, &cipher, max_header_len).await?;
+        let header = Header::from_bytes(header_bytes)?;
+        if header.variant != Variant::Syn {
+            sender.send((pubkey, Message::Header(header))).await?;
+        } else {
+            if !decider.syn_requested(&header) {
                 return Err(UnrequestedSyn);
             }
-            let l = reader.read_u32().await?;
-            let l = usize::try_from(l)?;
-            if l > max_data_len {
-                return Err(DataTooBig);
-            }
-            let enc_buf = &mut buf[..l];
-            let _ = reader.read_exact(enc_buf).await?;
-            let res = encode::decrypt_aes256gcm(&cipher, enc_buf)?;
-            sender.send((pubkey, res)).await?;
-        } else {
-            sender.send((pubkey, header.data)).await?;
+            let message =
+                decode_aes_len_encoded(&mut reader, &mut buf, &cipher, max_data_len).await?;
+            sender
+                .send((pubkey, Message::Syn(header.key, message)))
+                .await?;
         }
+    }
+}
+
+#[derive(Debug)]
+enum DecodeError {
+    Read(io::Error),
+    Decryption(aead::Error),
+    InvalidLen(TryFromIntError),
+    TooBig,
+}
+
+impl From<ReadU32Error> for DecodeError {
+    fn from(e: ReadU32Error) -> Self {
+        match e {
+            ReadU32Error::Read(e) => DecodeError::Read(e),
+            ReadU32Error::TooBig => DecodeError::TooBig,
+        }
+    }
+}
+
+impl From<aead::Error> for DecodeError {
+    fn from(e: aead::Error) -> Self {
+        DecodeError::Decryption(e)
+    }
+}
+
+impl From<TryFromIntError> for DecodeError {
+    fn from(e: TryFromIntError) -> Self {
+        DecodeError::InvalidLen(e)
+    }
+}
+
+impl From<io::Error> for DecodeError {
+    fn from(e: io::Error) -> Self {
+        DecodeError::Read(e)
+    }
+}
+
+async fn decode_aes_len_encoded<R: AsyncReadExt + Unpin>(
+    reader: &mut R,
+    buf: &mut [u8],
+    cipher: &Aes256Gcm,
+    limit: usize,
+) -> Result<Vec<u8>, DecodeError> {
+    let l = read_u32_len_with_limit(reader, limit as u32)
+        .await?
+        .try_into()?;
+    let enc_buf = &mut buf[..l];
+    let _ = reader.read_exact(enc_buf).await?;
+    encode::decrypt_aes256gcm(&cipher, enc_buf).map_err(DecodeError::from)
+}
+
+enum ReadU32Error {
+    Read(io::Error),
+    TooBig,
+}
+
+impl From<io::Error> for ReadU32Error {
+    fn from(e: io::Error) -> Self {
+        ReadU32Error::Read(e)
+    }
+}
+
+async fn read_u32_len_with_limit<R: AsyncReadExt + Unpin>(
+    reader: &mut R,
+    limit: u32,
+) -> Result<u32, ReadU32Error> {
+    let l = reader.read_u32().await?;
+    if l > limit {
+        Err(ReadU32Error::TooBig)
+    } else {
+        Ok(l)
     }
 }
 
@@ -169,18 +215,37 @@ async fn write_from_receiver(
     mut receiver: mpsc::Receiver<SendPair>,
 ) {
     while let Some((msg, responder)) = receiver.recv().await {
-        let msg = msg.to_bytes();
-        let mut buf = vec![0u8; 4 + aes256gcm_encrypted_len!(msg.len())];
-        let response = match encode::length_and_aes_encode(&mut buf, &msg, &cipher) {
-            Ok(()) => write_half.write_all(&buf).await.map_err(WriteError::Write),
-            Err(e) => Err(WriteError::from(e)),
+        let response = match msg {
+            Message::Header(header) => {
+                let header = header.to_bytes();
+                let mut buf = vec![0u8; 4 + aes256gcm_encrypted_len!(header.len())];
+                match encode::length_and_aes_encode(&mut buf, &header, &cipher) {
+                    Ok(()) => write_half.write_all(&buf).await.map_err(WriteError::Write),
+                    Err(e) => Err(WriteError::from(e)),
+                }
+            }
+            Message::Syn(key, value) => {
+                let header =
+                    Header::new(message::V1, Variant::Syn, message::UNUSED_PEER_ID, key).to_bytes();
+                let mut buf = vec![0u8; 4 + aes256gcm_encrypted_len!(header.len())];
+                let res1 = match encode::length_and_aes_encode(&mut buf, &header, &cipher) {
+                    Ok(()) => write_half.write_all(&buf).await.map_err(WriteError::Write),
+                    Err(e) => Err(WriteError::from(e)),
+                };
+                let mut buf = vec![0u8; 4 + aes256gcm_encrypted_len!(value.len())];
+                let res2 = match encode::length_and_aes_encode(&mut buf, &value, &cipher) {
+                    Ok(()) => write_half.write_all(&buf).await.map_err(WriteError::Write),
+                    Err(e) => Err(WriteError::from(e)),
+                };
+                res1.and(res2)
+            }
         };
         responder.send(response).ok();
     }
 }
 
 pub struct Connection {
-    reader: Option<mpsc::Receiver<(Public, Vec<u8>)>>,
+    reader: Option<mpsc::Receiver<(Public, Message)>>,
     writer: ConnectionWriter,
     cancel: oneshot::Sender<()>,
 }
@@ -240,7 +305,7 @@ impl Connection {
         self.writer.write(msg).await
     }
 
-    pub fn drain_into(&mut self, mut sink: mpsc::Sender<(Public, Vec<u8>)>) -> bool {
+    pub fn drain_into(&mut self, mut sink: mpsc::Sender<(Public, Message)>) -> bool {
         match self.reader.take() {
             Some(mut reader) => {
                 tokio::spawn(async move {
@@ -327,7 +392,7 @@ pub async fn keep_alive(
 }
 
 pub trait SynDecider {
-    fn accept_syn(&mut self, header: &Message) -> bool;
+    fn syn_requested(&mut self, header: &Header) -> bool;
 }
 
 pub struct ConnectionPool<T> {
@@ -336,7 +401,7 @@ pub struct ConnectionPool<T> {
     max_data_len: usize,
     buffer_size: usize,
     connections: HashMap<SocketAddr, Connection>,
-    reads_ref: mpsc::Sender<(Public, Vec<u8>)>,
+    reads_ref: mpsc::Sender<(Public, Message)>,
     decider: T,
 }
 
@@ -353,7 +418,7 @@ impl<T: SynDecider + Clone + Send + 'static> ConnectionPool<T> {
         max_data_len: usize,
         buffer_size: usize,
         decider: T,
-    ) -> (Self, mpsc::Receiver<(Public, Vec<u8>)>) {
+    ) -> (Self, mpsc::Receiver<(Public, Message)>) {
         let connections = HashMap::with_capacity(max_connections);
         let (tx, rx) = mpsc::channel(buffer_size);
         (

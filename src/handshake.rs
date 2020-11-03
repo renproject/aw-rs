@@ -27,6 +27,7 @@ pub enum Error {
     Decryption(publickey::Error),
     EchoMismatch,
     InvalidPubkey,
+    PubKeyMismatch,
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -34,6 +35,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 pub async fn client_handshake<RW: AsyncRead + AsyncWrite + Unpin>(
     mut conn: RW,
     client_keypair: &KeyPair,
+    expected_server_pubkey: Option<&Public>,
 ) -> Result<([u8; 32], Public)> {
     use Error::*;
 
@@ -43,6 +45,11 @@ pub async fn client_handshake<RW: AsyncRead + AsyncWrite + Unpin>(
     let read_buf = &mut buf[..PUBKEY_SIZE];
     conn.read_exact(read_buf).await.map_err(Read)?;
     let server_pubkey = read_pubkey(read_buf)?;
+    if let Some(expected_server_pubkey) = expected_server_pubkey {
+        if &server_pubkey != expected_server_pubkey {
+            return Err(PubKeyMismatch);
+        }
+    }
 
     // Write public key.
     conn.write_all(client_keypair.public().as_bytes())
@@ -190,7 +197,7 @@ mod tests {
         };
 
         let client_handle = std::thread::spawn(move || {
-            futures::executor::block_on(client_handshake(client_rw, &client_keypair_clone))
+            futures::executor::block_on(client_handshake(client_rw, &client_keypair_clone, None))
         });
         let server_handle = std::thread::spawn(move || {
             futures::executor::block_on(server_handshake(server_rw, &server_keypair_clone))

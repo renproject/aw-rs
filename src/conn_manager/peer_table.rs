@@ -1,4 +1,5 @@
 use parity_crypto::publickey::Public;
+use rand::seq::SliceRandom;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -11,34 +12,48 @@ pub fn id_from_pubkey(pubkey: &Public) -> PeerID {
     hasher.finalize().into()
 }
 
-pub struct PeerTable(HashMap<Public, SocketAddr>);
+pub struct PeerTable {
+    map: HashMap<Public, SocketAddr>,
+    vec: Vec<Public>,
+}
 
 impl PeerTable {
     pub fn new() -> Self {
-        Self(HashMap::new())
+        Self {
+            map: HashMap::new(),
+            vec: Vec::new(),
+        }
     }
 
     pub fn connection_exists_for_peer(&self, pubkey: &Public) -> bool {
-        self.0.contains_key(pubkey)
+        self.map.contains_key(pubkey)
     }
 
     pub fn num_peers(&self) -> usize {
-        self.0.len()
+        self.vec.len()
     }
 
     pub fn peers(&self) -> impl Iterator<Item = (&Public, &SocketAddr)> {
-        self.0.iter()
+        self.map.iter()
     }
 
     pub fn add_peer(&mut self, pubkey: Public, addr: SocketAddr) -> Option<SocketAddr> {
-        self.0.insert(pubkey, addr)
+        self.vec.push(pubkey);
+        self.map.insert(pubkey, addr)
     }
 
     pub fn has_peer(&self, pubkey: &Public) -> bool {
-        self.0.contains_key(pubkey)
+        self.map.contains_key(pubkey)
     }
 
     pub fn peer_addr(&self, pubkey: &Public) -> Option<&SocketAddr> {
-        self.0.get(pubkey)
+        self.map.get(pubkey)
+    }
+
+    pub fn random_peer_subset(&self, n: usize) -> Vec<Public> {
+        self.vec
+            .choose_multiple(&mut rand::thread_rng(), n)
+            .cloned()
+            .collect()
     }
 }
