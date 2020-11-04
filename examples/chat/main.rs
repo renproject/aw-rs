@@ -179,11 +179,16 @@ async fn main() {
         )
     });
 
-    while let Some((sender, msg)) = gossip_out.recv().await {
-        let pubkey_addr = publickey::public_to_address(&sender);
-        let string = match aliases.get_by_pubkey(&sender) {
-            Some(name) => format!("{}: {}", name, std::str::from_utf8(&msg).unwrap()),
-            None => format!("{}: {}", pubkey_addr, std::str::from_utf8(&msg).unwrap()),
+    while let Some((_, msg)) = gossip_out.recv().await {
+        let (from, msg) = {
+            let (from_bytes, msg) = msg.split_at(64);
+            let mut from = Public::default();
+            from.assign_from_slice(from_bytes);
+            (from, std::str::from_utf8(msg).unwrap())
+        };
+        let string = match aliases.get_by_pubkey(&from) {
+            Some(name) => format!("{}: {}", name, msg),
+            None => format!("{}: {}", from, msg),
         };
         screen.add_output_line(string);
         screen.print_screen();
@@ -270,7 +275,9 @@ fn parse_input(
             )
         };
         let msg_string = std::str::from_utf8(&msg).unwrap().to_owned();
-        if let Err(_) = sender.try_send((To::Peer(peer), key(&msg).to_vec(), msg)) {
+        let mut full_msg = keypair.public().as_bytes().to_vec();
+        full_msg.extend_from_slice(&msg);
+        if let Err(_) = sender.try_send((To::Peer(peer), key(&msg).to_vec(), full_msg)) {
             println!(
                 "error: not connected to peer {}",
                 publickey::public_to_address(&peer)
@@ -286,7 +293,9 @@ fn parse_input(
     if input.starts_with("*") {
         let msg = input[1..].as_bytes().to_owned();
         let msg_string = std::str::from_utf8(&msg).unwrap().to_owned();
-        if let Err(_) = sender.try_send((To::Gossip, key(&msg).to_vec(), msg)) {
+        let mut full_msg = keypair.public().as_bytes().to_vec();
+        full_msg.extend_from_slice(&msg);
+        if let Err(_) = sender.try_send((To::Gossip, key(&msg).to_vec(), full_msg)) {
             println!("error: could not gossip message");
         }
         return Ok(format!(">{}", msg_string));
