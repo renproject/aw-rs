@@ -7,6 +7,7 @@ use aw::util;
 use parity_crypto::publickey;
 use parity_crypto::publickey::{Generator, KeyPair, Public, Random};
 use sha2::{Digest, Sha256};
+use std::convert::TryFrom;
 use std::env;
 use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -15,6 +16,7 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 
 mod alias;
+mod message;
 
 use alias::Aliases;
 
@@ -180,15 +182,10 @@ async fn main() {
     });
 
     while let Some((_, msg)) = gossip_out.recv().await {
-        let (from, msg) = {
-            let (from_bytes, msg) = msg.split_at(64);
-            let mut from = Public::default();
-            from.assign_from_slice(from_bytes);
-            (from, std::str::from_utf8(msg).unwrap())
-        };
-        let string = match aliases.get_by_pubkey(&from) {
-            Some(name) => format!("{}: {}", name, msg),
-            None => format!("{}: {}", from, msg),
+        let msg = message::Message::try_from(msg.as_slice()).expect("TODO");
+        let string = match aliases.get_by_pubkey(&msg.from) {
+            Some(name) => format!("{}: {}", name, msg.message),
+            None => format!("{}: {}", msg.from, msg.message),
         };
         screen.add_output_line(string);
         screen.print_screen();
@@ -271,19 +268,20 @@ fn parse_input(
                 aliases
                     .pubkey_from_maybe_alias(peer)
                     .map_err(|_| ParseError::InvalidInput)?,
-                msg.as_bytes().to_owned(),
+                msg,
             )
         };
-        let msg_string = std::str::from_utf8(&msg).unwrap().to_owned();
-        let mut full_msg = keypair.public().as_bytes().to_vec();
-        full_msg.extend_from_slice(&msg);
-        if let Err(_) = sender.try_send((To::Peer(peer), key(&msg).to_vec(), full_msg)) {
+        let message = message::Message::new_from_pubkey_and_bytes(peer, msg.as_bytes())
+            .map_err(|_| ParseError::InvalidInput)?;
+        if let Err(_) =
+            sender.try_send((To::Peer(peer), key(msg.as_bytes()).to_vec(), message.into()))
+        {
             println!(
                 "error: not connected to peer {}",
                 publickey::public_to_address(&peer)
             );
         }
-        return Ok(format!(">{}", msg_string));
+        return Ok(format!(">{}", msg));
     }
 
     if input.starts_with("#") {
