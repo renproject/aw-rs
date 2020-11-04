@@ -110,9 +110,7 @@ async fn read_into_sender<R: AsyncReadExt + Unpin, T: SynDecider>(
             }
             let message =
                 decode_aes_len_encoded(&mut reader, &mut buf, &cipher, max_data_len).await?;
-            sender
-                .send((pubkey, Message::Syn(header.key, message)))
-                .await?;
+            sender.send((pubkey, Message::Syn(header, message))).await?;
         }
     }
 }
@@ -224,9 +222,9 @@ async fn write_from_receiver(
                     Err(e) => Err(WriteError::from(e)),
                 }
             }
-            Message::Syn(key, value) => {
-                let header =
-                    Header::new(message::V1, Variant::Syn, message::UNUSED_PEER_ID, key).to_bytes();
+            Message::Syn(header, value) => {
+                // TODO(ross): Clean this up.
+                let header = header.to_bytes();
                 let mut buf = vec![0u8; 4 + aes256gcm_encrypted_len!(header.len())];
                 let res1 = match encode::length_and_aes_encode(&mut buf, &header, &cipher) {
                     Ok(()) => write_half.write_all(&buf).await.map_err(WriteError::Write),

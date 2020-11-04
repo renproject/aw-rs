@@ -1,6 +1,6 @@
 use crate::conn_manager::peer_table;
 use crate::conn_manager::{self, connection::SynDecider, ConnectionManager};
-use crate::message::{self, Header, Message, Variant, V1};
+use crate::message::{self, Header, Message, To, Variant, V1};
 use crate::util;
 use futures::future::Future;
 use parity_crypto::publickey::Public;
@@ -12,13 +12,14 @@ use tokio::sync::mpsc;
 pub fn gossip_task<F>(
     buffer_size: usize,
     alpha: usize,
+    own_pubkey: Public,
     will_pull: F,
     decider: &Decider,
     conn_manager: Arc<Mutex<ConnectionManager<Decider>>>,
 ) -> (
     impl Future<Output = Result<(), mpsc::error::TrySendError<(Public, Vec<u8>)>>>,
     mpsc::Sender<(Public, Message)>,
-    mpsc::Sender<(Public, Vec<u8>, Vec<u8>)>,
+    mpsc::Sender<(To, Vec<u8>, Vec<u8>)>,
     mpsc::Receiver<(Public, Vec<u8>)>,
 )
 where
@@ -31,6 +32,7 @@ where
     let requested = decider.requested.clone();
     let fut = consumer_fut(
         alpha,
+        own_pubkey,
         network_receiver,
         user_in_receiver,
         user_out_sender,
@@ -45,8 +47,9 @@ where
 
 async fn consumer_fut<F>(
     alpha: usize,
+    own_pubkey: Public,
     network_receiver: mpsc::Receiver<(Public, Message)>,
-    user_receiver: mpsc::Receiver<(Public, Vec<u8>, Vec<u8>)>,
+    user_receiver: mpsc::Receiver<(To, Vec<u8>, Vec<u8>)>,
     user_sender: mpsc::Sender<(Public, Vec<u8>)>,
     will_pull: F,
     received: Arc<Mutex<HashMap<Vec<u8>, Option<Vec<u8>>>>>,
@@ -58,6 +61,7 @@ where
 {
     let network_fut = network_fut(
         alpha,
+        own_pubkey,
         network_receiver,
         user_sender,
         will_pull,
@@ -65,31 +69,53 @@ where
         requested,
         conn_manager.clone(),
     );
-    let user_fut = user_fut(user_receiver, received, conn_manager);
+    let user_fut = user_fut(alpha, user_receiver, received, conn_manager);
 
     futures::future::join(network_fut, user_fut).await.0
 }
 
 async fn user_fut(
-    mut user_receiver: mpsc::Receiver<(Public, Vec<u8>, Vec<u8>)>,
+    alpha: usize,
+    mut user_receiver: mpsc::Receiver<(To, Vec<u8>, Vec<u8>)>,
     received: Arc<Mutex<HashMap<Vec<u8>, Option<Vec<u8>>>>>,
     conn_manager: Arc<Mutex<ConnectionManager<Decider>>>,
 ) {
-    while let Some((pubkey, key, message)) = user_receiver.recv().await {
+    while let Some((to, key, message)) = user_receiver.recv().await {
         {
             let mut received = util::get_lock(&received);
             received.insert(key.clone(), Some(message));
         }
-        let header = Header::new(V1, Variant::Push, peer_table::id_from_pubkey(&pubkey), key);
-        let message = Message::Header(header);
-        conn_manager::try_send_peer(&conn_manager, &pubkey, message)
-            .await
-            .expect("TODO");
+        match to {
+            To::Peer(pubkey) => {
+                let header =
+                    Header::new(V1, Variant::Push, peer_table::id_from_pubkey(&pubkey), key);
+                let message = Message::Header(header);
+                conn_manager::try_send_peer(&conn_manager, &pubkey, message)
+                    .await
+                    .expect("TODO");
+            }
+            To::Subnet(_) => todo!(),
+            To::Gossip => {
+                let peers = {
+                    let conn_manager = util::get_lock(&conn_manager);
+                    conn_manager.random_peer_subset(alpha)
+                };
+                let header = Header::new(V1, Variant::Push, message::GOSSIP_PEER_ID, key);
+                let message = Message::Header(header);
+                futures::future::join_all(
+                    peers.iter().map(|peer| {
+                        conn_manager::try_send_peer(&conn_manager, peer, message.clone())
+                    }),
+                )
+                .await;
+            }
+        }
     }
 }
 
 async fn network_fut<F>(
     alpha: usize,
+    own_pubkey: Public,
     mut network_receiver: mpsc::Receiver<(Public, Message)>,
     mut user_sender: mpsc::Sender<(Public, Vec<u8>)>,
     will_pull: F,
@@ -101,19 +127,20 @@ where
     F: Fn(&Header) -> bool,
 {
     while let Some((pubkey, message)) = network_receiver.next().await {
-        if let Message::Header(header) = &message {
-            if header.variant == Variant::Push {
-                let contains_key = {
-                    let received = util::get_lock(&received);
-                    received.contains_key(header.key.as_slice())
-                };
-                // We only forward a header to other peers if we have not already done so for the
-                // given header.
-                if !contains_key {
+        match &message {
+            Message::Header(_header) => (),
+            Message::Syn(header, _) => {
+                if header.to != peer_table::id_from_pubkey(&own_pubkey) {
                     let peers = {
                         let conn_manager = util::get_lock(&conn_manager);
                         conn_manager.random_peer_subset(alpha)
                     };
+                    let message = Message::Header(Header::new(
+                        message::V1,
+                        Variant::Push,
+                        header.to,
+                        header.key.clone(),
+                    ));
                     // TODO(ross): Ideally we should keep trying to send to peers until we are
                     // reasonably confident that `alpha` of them will receive the message;
                     // currently it is possible that anywhere between 0 and `alpha` peers will
@@ -174,7 +201,7 @@ where
                         Some(Response::Network(Message::Header(Header::new(
                             message::V1,
                             Variant::Pull,
-                            message::UNUSED_PEER_ID,
+                            header.to,
                             header.key,
                         ))))
                     } else {
@@ -185,7 +212,8 @@ where
             Variant::Pull => {
                 let received = util::get_lock(&received);
                 if let Some(Some(msg)) = received.get(header.key.as_slice()) {
-                    Some(Response::Network(Message::Syn(header.key, msg.clone())))
+                    let header = Header::new(message::V1, Variant::Syn, header.to, header.key);
+                    Some(Response::Network(Message::Syn(header, msg.clone())))
                 } else {
                     None
                 }
@@ -197,15 +225,15 @@ where
                 todo!()
             }
         },
-        Message::Syn(key, msg) => {
+        Message::Syn(header, msg) => {
             let mut requested = util::get_lock(&requested);
             let mut received = util::get_lock(&received);
-            if requested.remove(key.as_slice()).is_some() {
+            if requested.remove(header.key.as_slice()).is_some() {
                 // TODO(ross): The message was not actually requested but we are receiving it
                 // anyway. What should we do here?
             }
             received
-                .get_mut(key.as_slice())
+                .get_mut(header.key.as_slice())
                 .and_then(|value| value.replace(msg.clone()));
             Some(Response::User(msg))
         }

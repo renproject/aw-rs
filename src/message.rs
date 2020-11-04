@@ -1,4 +1,5 @@
 use crate::conn_manager::peer_table::PeerID;
+use parity_crypto::publickey::Public;
 use std::convert::{TryFrom, TryInto};
 
 pub const GOSSIP_PEER_ID: [u8; 32] = [0xff; 32];
@@ -57,10 +58,16 @@ impl TryFrom<u16> for Variant {
     }
 }
 
+pub enum To {
+    Peer(Public),
+    Subnet([u8; 32]),
+    Gossip,
+}
+
 #[derive(Debug, Clone)]
 pub enum Message {
     Header(Header),
-    Syn(Vec<u8>, Vec<u8>),
+    Syn(Header, Vec<u8>),
 }
 
 #[derive(Debug, Clone)]

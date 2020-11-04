@@ -2,7 +2,7 @@ use aw::conn_manager::connection::ConnectionPool;
 use aw::conn_manager::peer_table::{self, PeerTable};
 use aw::conn_manager::{self, ConnectionManager};
 use aw::gossip::{self, Decider};
-use aw::message::Header;
+use aw::message::{Header, To, GOSSIP_PEER_ID};
 use aw::util;
 use parity_crypto::publickey;
 use parity_crypto::publickey::{Generator, KeyPair, Public, Random};
@@ -129,7 +129,9 @@ async fn main() {
     let buffer_size = 100;
     let alpha = 3;
     let decider = Decider::new();
-    let will_pull = move |header: &Header| header.to == peer_table::id_from_pubkey(&own_pubkey);
+    let will_pull = move |header: &Header| {
+        header.to == peer_table::id_from_pubkey(&own_pubkey) || header.to == GOSSIP_PEER_ID
+    };
     let (pool, mut reads) = ConnectionPool::new_with_max_connections_allocated(
         max_connections,
         max_header_len,
@@ -142,6 +144,7 @@ async fn main() {
     let (gossip_fut, mut cm_in, gossip_in, mut gossip_out) = gossip::gossip_task(
         buffer_size,
         alpha,
+        own_pubkey,
         will_pull,
         &decider,
         conn_manager.clone(),
@@ -192,7 +195,7 @@ async fn main() {
 
 fn read_input(
     conn_manager: &Arc<Mutex<ConnectionManager<Decider>>>,
-    mut sender: mpsc::Sender<(Public, Vec<u8>, Vec<u8>)>,
+    mut sender: mpsc::Sender<(To, Vec<u8>, Vec<u8>)>,
     mut aliases: Aliases,
     keypair: KeyPair,
     mut screen: ScreenText,
@@ -240,7 +243,7 @@ enum ParseError {
 
 fn parse_input(
     conn_manager: &Arc<Mutex<ConnectionManager<Decider>>>,
-    sender: &mut mpsc::Sender<(Public, Vec<u8>, Vec<u8>)>,
+    sender: &mut mpsc::Sender<(To, Vec<u8>, Vec<u8>)>,
     aliases: &mut Aliases,
     keypair: &KeyPair,
     input: &str,
@@ -267,7 +270,7 @@ fn parse_input(
             )
         };
         let msg_string = std::str::from_utf8(&msg).unwrap().to_owned();
-        if let Err(_) = sender.try_send((peer, key(&msg).to_vec(), msg)) {
+        if let Err(_) = sender.try_send((To::Peer(peer), key(&msg).to_vec(), msg)) {
             println!(
                 "error: not connected to peer {}",
                 publickey::public_to_address(&peer)
@@ -281,17 +284,12 @@ fn parse_input(
     }
 
     if input.starts_with("*") {
-        unimplemented!()
-        /*
         let msg = input[1..].as_bytes().to_owned();
         let msg_string = std::str::from_utf8(&msg).unwrap().to_owned();
-        tokio::spawn(async move {
-            conn_manager::send_to_all(&conn_manager, &msg)
-                .await
-                .expect("TODO")
-        });
+        if let Err(_) = sender.try_send((To::Gossip, key(&msg).to_vec(), msg)) {
+            println!("error: could not gossip message");
+        }
         return Ok(format!(">{}", msg_string));
-        */
     }
 
     Err(ParseError::InvalidInput)
@@ -398,5 +396,12 @@ async fn parse_command(
 fn key(msg: &[u8]) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(msg);
+    hasher.update(
+        &std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("TODO")
+            .as_secs()
+            .to_be_bytes(),
+    );
     hasher.finalize().into()
 }
