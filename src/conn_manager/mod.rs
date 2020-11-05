@@ -67,26 +67,6 @@ pub async fn try_send_peer<T: SynDecider + Clone + Send + 'static>(
     }
 }
 
-pub async fn send_to_all<T: SynDecider + Clone + Send + 'static>(
-    conn_manager: &SharedPtr<ConnectionManager<T>>,
-    msg: Message,
-) -> Result<(), Error> {
-    let mut writers = {
-        let conn_manager_lock = util::get_lock(conn_manager);
-        conn_manager_lock
-            .pool
-            .iter()
-            .map(|(_, conn)| conn.writer())
-            .collect::<Vec<_>>()
-    };
-    // TODO(ross): This fails when any of the sends didn't succeed, but in practice for a gossip
-    // style execution we will only care if at least a certain number of peers are reached.
-    futures::future::try_join_all(writers.iter_mut().map(|writer| writer.write(msg.clone())))
-        .await
-        .map(drop)
-        .map_err(Error::Connection)
-}
-
 #[derive(Debug)]
 pub enum Error {
     Handshake(handshake::Error),

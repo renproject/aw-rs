@@ -1,4 +1,5 @@
 use parity_crypto::publickey::Public;
+use sha2::{Digest, Sha256};
 use std::convert::TryFrom;
 use std::str::{self, Utf8Error};
 
@@ -45,4 +46,17 @@ impl TryFrom<&[u8]> for Message {
         msg.message.push_str(str::from_utf8(message)?);
         Ok(msg)
     }
+}
+
+pub fn key(msg: &[u8]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(msg);
+    hasher.update(
+        &std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("TODO")
+            .as_secs()
+            .to_be_bytes(),
+    );
+    hasher.finalize().into()
 }

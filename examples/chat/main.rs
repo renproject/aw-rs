@@ -1,111 +1,21 @@
-use aw::conn_manager::connection::ConnectionPool;
-use aw::conn_manager::peer_table::{self, PeerTable};
-use aw::conn_manager::{self, ConnectionManager};
-use aw::gossip::{self, Decider};
 use aw::message::{Header, To, GOSSIP_PEER_ID};
-use aw::util;
+use aw::{conn_manager, util, ConnectionManager};
 use parity_crypto::publickey;
 use parity_crypto::publickey::{Generator, KeyPair, Public, Random};
-use sha2::{Digest, Sha256};
 use std::convert::TryFrom;
 use std::env;
-use std::io::{Read, Write};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::io::Read;
+use std::net::SocketAddr;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 
 mod alias;
 mod message;
+mod tui;
 
 use alias::Aliases;
-
-fn flush() {
-    std::io::stdout().flush().unwrap();
-}
-
-fn clear_screen() {
-    print!("\x1b[2J\x1b[1;1H");
-}
-
-fn cursor_to_bottom() {
-    print!("\x1b[100E");
-}
-
-fn cursor_to_top() {
-    print!("\x1b[H");
-}
-
-fn save_cursor_position() {
-    print!("\x1b[s");
-}
-
-fn load_cursor_position() {
-    print!("\x1b[u");
-}
-
-fn advance_cursor() {
-    print!("\x1b[C");
-}
-
-fn retreat_cursor() {
-    print!("\x1b[D");
-}
-
-fn cursor_start_of_line() {
-    print!("\x1b[500D");
-}
-
-#[derive(Clone)]
-struct ScreenText(Arc<Mutex<(Vec<String>, String)>>);
-
-impl ScreenText {
-    fn new() -> Self {
-        Self(Arc::new(Mutex::new((Vec::new(), String::new()))))
-    }
-
-    fn add_stdin_char(&mut self, c: char) {
-        let mut lock = util::get_lock(&self.0);
-        lock.1.push(c);
-        advance_cursor();
-    }
-
-    fn backspace(&mut self) {
-        let mut lock = util::get_lock(&self.0);
-        lock.1.pop();
-        retreat_cursor();
-    }
-
-    fn clear_input(&mut self) {
-        let mut lock = util::get_lock(&self.0);
-        lock.1.clear();
-        cursor_start_of_line();
-    }
-
-    fn input(&self) -> String {
-        let lock = util::get_lock(&self.0);
-        lock.1.clone()
-    }
-
-    fn add_output_line(&mut self, s: String) {
-        let mut lock = util::get_lock(&self.0);
-        lock.0.push(s);
-    }
-
-    fn print_screen(&self) {
-        let lock = util::get_lock(&self.0);
-        save_cursor_position();
-        clear_screen();
-        cursor_to_bottom();
-        print!("{}", lock.1);
-        cursor_to_top();
-        for line in lock.0.iter() {
-            println!("{}", line);
-        }
-        load_cursor_position();
-        flush();
-    }
-}
+use tui::ScreenText;
 
 #[tokio::main]
 async fn main() {
@@ -117,11 +27,6 @@ async fn main() {
     let addr_str = args.pop().expect("address arg");
     let port = addr_str.parse().expect("invalid port argument");
 
-    let mut screen = ScreenText::new();
-    clear_screen();
-    cursor_to_bottom();
-    flush();
-
     let keypair = Random.generate();
     let own_pubkey = *keypair.public();
 
@@ -130,58 +35,31 @@ async fn main() {
     let max_data_len = 2048;
     let buffer_size = 100;
     let alpha = 3;
-    let decider = Decider::new();
     let will_pull = move |header: &Header| {
-        header.to == peer_table::id_from_pubkey(&own_pubkey) || header.to == GOSSIP_PEER_ID
+        header.to == aw::id_from_pubkey(&own_pubkey) || header.to == GOSSIP_PEER_ID
     };
-    let (pool, mut reads) = ConnectionPool::new_with_max_connections_allocated(
+    let (aw_fut, conn_manager, aw_in, mut aw_out) = aw::new_aw_task(
+        keypair.clone(),
+        port,
+        will_pull,
         max_connections,
         max_header_len,
         max_data_len,
         buffer_size,
-        decider.clone(),
-    );
-    let table = PeerTable::new();
-    let conn_manager = Arc::new(Mutex::new(ConnectionManager::new(pool, table)));
-    let (gossip_fut, mut cm_in, gossip_in, mut gossip_out) = gossip::gossip_task(
-        buffer_size,
         alpha,
-        own_pubkey,
-        will_pull,
-        &decider,
-        conn_manager.clone(),
     );
-    let cm_to_gossiper_fut = async move {
-        while let Some(msg) = reads.recv().await {
-            if cm_in.send(msg).await.is_err() {
-                break;
-            }
-        }
-    };
+    let aw_handle = tokio::spawn(aw_fut);
 
-    let gossip_handle = tokio::spawn(futures::future::join(gossip_fut, cm_to_gossiper_fut));
-
-    let listen_handle = tokio::spawn(conn_manager::listen_for_peers(
-        conn_manager.clone(),
-        keypair.clone(),
-        IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)),
-        port,
-    ));
-
+    let mut screen = ScreenText::new();
+    tui::init_screen();
     let aliases = Aliases::new();
     let aliases_clone = aliases.clone();
     let screen_clone = screen.clone();
     tokio::task::spawn_blocking(move || {
-        read_input(
-            &conn_manager,
-            gossip_in,
-            aliases_clone,
-            keypair,
-            screen_clone,
-        )
+        read_input(&conn_manager, aw_in, aliases_clone, keypair, screen_clone)
     });
 
-    while let Some((_, msg)) = gossip_out.recv().await {
+    while let Some((_, msg)) = aw_out.recv().await {
         let msg = message::Message::try_from(msg.as_slice()).expect("TODO");
         let string = match aliases.get_by_pubkey(&msg.from) {
             Some(name) => format!("{}: {}", name, msg.message),
@@ -191,12 +69,11 @@ async fn main() {
         screen.print_screen();
     }
 
-    listen_handle.await.unwrap().unwrap();
-    gossip_handle.await.unwrap().0.unwrap();
+    aw_handle.await.unwrap().unwrap();
 }
 
 fn read_input(
-    conn_manager: &Arc<Mutex<ConnectionManager<Decider>>>,
+    conn_manager: &Arc<Mutex<ConnectionManager>>,
     mut sender: mpsc::Sender<(To, Vec<u8>, Vec<u8>)>,
     mut aliases: Aliases,
     keypair: KeyPair,
@@ -244,7 +121,7 @@ enum ParseError {
 }
 
 fn parse_input(
-    conn_manager: &Arc<Mutex<ConnectionManager<Decider>>>,
+    conn_manager: &Arc<Mutex<ConnectionManager>>,
     sender: &mut mpsc::Sender<(To, Vec<u8>, Vec<u8>)>,
     aliases: &mut Aliases,
     keypair: &KeyPair,
@@ -271,11 +148,14 @@ fn parse_input(
                 msg,
             )
         };
-        let message = message::Message::new_from_pubkey_and_bytes(peer, msg.as_bytes())
-            .map_err(|_| ParseError::InvalidInput)?;
-        if let Err(_) =
-            sender.try_send((To::Peer(peer), key(msg.as_bytes()).to_vec(), message.into()))
-        {
+        let message =
+            message::Message::new_from_pubkey_and_bytes(*keypair.public(), msg.as_bytes())
+                .map_err(|_| ParseError::InvalidInput)?;
+        if let Err(_) = sender.try_send((
+            To::Peer(peer),
+            message::key(msg.as_bytes()).to_vec(),
+            message.into(),
+        )) {
             println!(
                 "error: not connected to peer {}",
                 publickey::public_to_address(&peer)
@@ -293,7 +173,7 @@ fn parse_input(
         let msg_string = std::str::from_utf8(&msg).unwrap().to_owned();
         let mut full_msg = keypair.public().as_bytes().to_vec();
         full_msg.extend_from_slice(&msg);
-        if let Err(_) = sender.try_send((To::Gossip, key(&msg).to_vec(), full_msg)) {
+        if let Err(_) = sender.try_send((To::Gossip, message::key(&msg).to_vec(), full_msg)) {
             println!("error: could not gossip message");
         }
         return Ok(format!(">{}", msg_string));
@@ -303,7 +183,7 @@ fn parse_input(
 }
 
 async fn parse_command(
-    conn_manager: &Arc<Mutex<ConnectionManager<Decider>>>,
+    conn_manager: &Arc<Mutex<ConnectionManager>>,
     aliases: &mut Aliases,
     keypair: &KeyPair,
     command: &str,
@@ -346,10 +226,7 @@ async fn parse_command(
                     );
                     Ok(string)
                 }
-                "id" => Ok(format!(
-                    "{:?}",
-                    peer_table::id_from_pubkey(keypair.public())
-                )),
+                "id" => Ok(format!("{:?}", aw::id_from_pubkey(keypair.public()))),
                 _ => Err(InvalidArguments),
             }
         }
@@ -398,17 +275,4 @@ async fn parse_command(
         }
         _ => Err(InvalidCommand),
     }
-}
-
-fn key(msg: &[u8]) -> [u8; 32] {
-    let mut hasher = Sha256::new();
-    hasher.update(msg);
-    hasher.update(
-        &std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("TODO")
-            .as_secs()
-            .to_be_bytes(),
-    );
-    hasher.finalize().into()
 }
