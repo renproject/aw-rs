@@ -108,7 +108,7 @@ pub async fn establish_connection<'a, T: SynDecider + Clone + Send + 'static>(
         match TcpStream::connect(addr).await {
             Ok(mut stream) => {
                 let (key, server_pubkey) =
-                    handshake::client_handshake(&mut stream, keypair, Some(peer_pubkey)).await?;
+                    handshake::handshake(&mut stream, keypair, Some(peer_pubkey)).await?;
                 return add_to_pool_with_reuse(
                     conn_manager.clone(),
                     stream,
@@ -142,7 +142,7 @@ pub async fn listen_for_peers<T: SynDecider + Clone + Send + 'static>(
                 let keypair = keypair.clone();
                 let conn_manager = conn_manager.clone();
                 tokio::spawn(async move {
-                    match handshake::server_handshake(&mut stream, &keypair).await {
+                    match handshake::handshake(&mut stream, &keypair, None).await {
                         Ok((key, client_pubkey)) => {
                             match add_to_pool_with_reuse(
                                 conn_manager,

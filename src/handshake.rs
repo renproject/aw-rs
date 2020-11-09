@@ -1,8 +1,10 @@
+use futures::{future, Future};
 use parity_crypto::publickey::{self, ecies, KeyPair, Public, Secret};
 use secp256k1::group::{fe::Fe, Ge};
 use std::io;
-
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::net::TcpStream;
+use tokio::sync::oneshot::{self, error::RecvError};
 
 const SECRET_SIZE: usize = 32;
 const PUBKEY_SIZE: usize = 64;
@@ -25,12 +27,120 @@ pub enum Error {
     Read(io::Error),
     Encryption(publickey::Error),
     Decryption(publickey::Error),
+    Sender,
+    Receiver,
     EchoMismatch,
     InvalidPubkey,
     PubKeyMismatch,
 }
 
+impl From<RecvError> for Error {
+    fn from(_: RecvError) -> Self {
+        Self::Receiver
+    }
+}
+
 pub type Result<T> = std::result::Result<T, Error>;
+
+pub async fn handshake(
+    conn: &mut TcpStream,
+    own_keypair: &KeyPair,
+    expected_peer_pubkey: Option<&Public>,
+) -> Result<([u8; 32], Public)> {
+    // NOTE(ross): Using `split` instead of `into_split` here forces us to complete both halves of
+    // the handshake in the same task. We will need to use the latter method if we want the
+    // handshake to run on separate tasks.
+    let (read_half, write_half) = conn.split();
+    let (peer_pubkey_sender, peer_pubkey_receiver) = oneshot::channel();
+    let (peer_secret_sender, peer_secret_receiver) = oneshot::channel();
+    let own_secret = rand::random::<[u8; 32]>();
+
+    let read_fut = handshake_read_half(
+        read_half,
+        own_keypair,
+        expected_peer_pubkey,
+        own_secret,
+        peer_pubkey_sender,
+        peer_secret_sender,
+    );
+    let write_fut = handshake_write_half(
+        write_half,
+        own_keypair.public(),
+        own_secret,
+        peer_pubkey_receiver,
+        peer_secret_receiver,
+    );
+
+    // NOTE(ross): Here we are joining, so we have only one task and the read and write futures
+    // will not be able to execute in parallel. Separate tasks should be used if we desire parallel
+    // execution.
+    let ((peer_pubkey, peer_secret), _) = future::try_join(read_fut, write_fut).await?;
+    let session_key = session_key(&own_secret, &peer_secret);
+    Ok((session_key, peer_pubkey))
+}
+
+async fn handshake_write_half<W, PKF, SF>(
+    mut writer: W,
+    own_pubkey: &Public,
+    own_secret: [u8; 32],
+    peer_pubkey_fut: PKF,
+    peer_secret_fut: SF,
+) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+    PKF: Future<Output = std::result::Result<Public, RecvError>>,
+    SF: Future<Output = std::result::Result<[u8; 32], RecvError>>,
+{
+    writer
+        .write_all(own_pubkey.as_bytes())
+        .await
+        .map_err(Error::Write)?;
+    let peer_pubkey = peer_pubkey_fut.await?;
+
+    let msg_enc = ecies::encrypt(&peer_pubkey, &[], &own_secret).map_err(Error::Encryption)?;
+    writer.write_all(&msg_enc).await.map_err(Error::Write)?;
+
+    let peer_secret = peer_secret_fut.await?;
+    let msg_enc = ecies::encrypt(&peer_pubkey, &[], &peer_secret).map_err(Error::Encryption)?;
+    writer.write_all(&msg_enc).await.map_err(Error::Write)
+}
+
+async fn handshake_read_half<R: AsyncRead + Unpin>(
+    mut reader: R,
+    own_keypair: &KeyPair,
+    expected_peer_pubkey: Option<&Public>,
+    own_secret: [u8; 32],
+    peer_pubkey_sender: oneshot::Sender<Public>,
+    peer_secret_sender: oneshot::Sender<[u8; 32]>,
+) -> Result<(Public, [u8; 32])> {
+    let mut buf = [0u8; MAX_CLIENT_READ_SIZE];
+
+    let read_buf = &mut buf[..PUBKEY_SIZE];
+    reader.read_exact(read_buf).await.map_err(Error::Read)?;
+    let peer_pubkey = read_pubkey(read_buf)?;
+    if let Some(expected_peer_pubkey) = expected_peer_pubkey {
+        if &peer_pubkey != expected_peer_pubkey {
+            return Err(Error::PubKeyMismatch);
+        }
+    }
+    peer_pubkey_sender
+        .send(peer_pubkey)
+        .map_err(|_| Error::Sender)?;
+
+    let mut peer_secret = [0u8; 32];
+    let read_buf = &mut buf[..ENC_SECRET_SIZE];
+    reader.read_exact(read_buf).await.map_err(Error::Read)?;
+    peer_secret.copy_from_slice(&client_read_server_secret(read_buf, own_keypair.secret())?);
+    peer_secret_sender
+        .send(peer_secret)
+        .map_err(|_| Error::Sender)?;
+
+    let read_buf = &mut buf[..ENC_SECRET_SIZE];
+    reader.read_exact(read_buf).await.map_err(Error::Read)?;
+    client_read_and_check_secret_echo(read_buf, own_keypair.secret(), &own_secret)?;
+
+    Ok((peer_pubkey, peer_secret))
+}
 
 pub async fn client_handshake<RW: AsyncRead + AsyncWrite + Unpin>(
     mut conn: RW,
@@ -178,6 +288,36 @@ mod tests {
     use super::*;
     use crate::util::{ChannelRW, ChunkedRW};
     use parity_crypto::publickey::{Generator, Random};
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use tokio::net::TcpListener;
+
+    #[tokio::test]
+    async fn successful_symmetric_handshake() {
+        let alice_keypair = Random.generate();
+        let bob_keypair = Random.generate();
+
+        let mut listener = TcpListener::bind("0.0.0.0:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let connect_fut =
+            TcpStream::connect(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), port));
+        let accept_fut = listener.accept();
+        let (connect_res, accept_res) = future::join(connect_fut, accept_fut).await;
+        let mut client_stream = connect_res.unwrap();
+        let (mut server_stream, _) = accept_res.unwrap();
+
+        let (alice_res, bob_res) = future::join(
+            handshake(&mut client_stream, &alice_keypair, None),
+            handshake(&mut server_stream, &bob_keypair, None),
+        )
+        .await;
+
+        let (alice_secret, alice_peer_pubkey) = alice_res.unwrap();
+        let (bob_secret, bob_peer_pubkey) = bob_res.unwrap();
+
+        assert_eq!(alice_secret, bob_secret);
+        assert_eq!(&alice_peer_pubkey, bob_keypair.public());
+        assert_eq!(&bob_peer_pubkey, alice_keypair.public());
+    }
 
     #[test]
     fn successful_handshake() {
