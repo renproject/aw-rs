@@ -3,7 +3,9 @@ use crate::handshake;
 use crate::message::Message;
 use crate::util::{self, SharedPtr};
 use aes_gcm::aead::{generic_array::GenericArray, NewAead};
+use futures::Future;
 use parity_crypto::publickey::{KeyPair, Public};
+use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
@@ -127,56 +129,62 @@ pub async fn establish_connection<'a, T: SynDecider + Clone + Send + 'static>(
     }
 }
 
-pub async fn listen_for_peers<T: SynDecider + Clone + Send + 'static>(
+pub fn listen_for_peers<T: SynDecider + Clone + Send + 'static>(
     conn_manager: SharedPtr<ConnectionManager<T>>,
     keypair: KeyPair,
     addr: IpAddr,
     port: u16,
-) -> Result<(), Error> {
-    let mut listener = TcpListener::bind(SocketAddr::new(addr, port))
-        .await
-        .map_err(Error::Tcp)?;
-    while let Some(stream) = listener.incoming().next().await {
-        match stream {
-            Ok(mut stream) => {
-                let keypair = keypair.clone();
-                let conn_manager = conn_manager.clone();
-                tokio::spawn(async move {
-                    match handshake::handshake(&mut stream, &keypair, None).await {
-                        Ok((key, client_pubkey)) => {
-                            match add_to_pool_with_reuse(
-                                conn_manager,
-                                stream,
-                                keypair.public(),
-                                client_pubkey,
-                                key,
-                            )
-                            .await
-                            {
-                                Ok(replaced) => {
-                                    if let Some(_replaced) = replaced {
-                                        // TODO(ross): Do we want to create logs when replacing
-                                        // duplicate connections?
+) -> Result<(u16, impl Future<Output = ()>), io::Error> {
+    // NOTE(ross): Here we block on binding the listener, because when binding to a socket address
+    // (or more specifically an address that doesn't require a DNS lookup) the call should complete
+    // immediately, and we want to be able to immediately return the port in case the given port
+    // was 0 (in which case the actual port will be randomly assigned).
+    let mut listener = futures::executor::block_on(TcpListener::bind(SocketAddr::new(addr, port)))?;
+    let port = listener.local_addr()?.port();
+
+    let fut = async move {
+        while let Some(stream) = listener.incoming().next().await {
+            match stream {
+                Ok(mut stream) => {
+                    let keypair = keypair.clone();
+                    let conn_manager = conn_manager.clone();
+                    tokio::spawn(async move {
+                        match handshake::handshake(&mut stream, &keypair, None).await {
+                            Ok((key, client_pubkey)) => {
+                                match add_to_pool_with_reuse(
+                                    conn_manager,
+                                    stream,
+                                    keypair.public(),
+                                    client_pubkey,
+                                    key,
+                                )
+                                .await
+                                {
+                                    Ok(replaced) => {
+                                        if let Some(_replaced) = replaced {
+                                            // TODO(ross): Do we want to create logs when replacing
+                                            // duplicate connections?
+                                        }
+                                    }
+                                    Err(_e) => {
+                                        // TODO(ross): What to do when the pool is full?
                                     }
                                 }
-                                Err(_e) => {
-                                    // TODO(ross): What to do when the pool is full?
-                                }
+                            }
+                            Err(_e) => {
+                                // TODO(ross): Should we log failed handshake attempts?
                             }
                         }
-                        Err(_e) => {
-                            // TODO(ross): Should we log failed handshake attempts?
-                        }
-                    }
-                });
-            }
-            Err(_e) => {
-                // TODO(ross): Do we want to log this?
+                    });
+                }
+                Err(_e) => {
+                    // TODO(ross): Do we want to log this?
+                }
             }
         }
-    }
+    };
 
-    Ok(())
+    Ok((port, fut))
 }
 
 async fn add_to_pool_with_reuse<T: SynDecider + Clone + Send + 'static>(

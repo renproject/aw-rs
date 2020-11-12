@@ -269,6 +269,18 @@ impl Connection {
         decider: T,
     ) -> Self {
         let cipher = aes_gcm::AesGcm::new(GenericArray::from_slice(&key));
+
+        // Disable the Nagle algorithm for the socket. We do this because otherwise the socket will
+        // not send the next message until the previous send has been ACKed, which may be delayed
+        // 40ms at the receiver side, not to mention any network delays.
+        //
+        // NOTE(ross): We are unwrapping this because the error cases expressed in `man 3
+        // setsockopt` seem like they would not occurr in a properly functioning system. However,
+        // do we want to recover anyway and not set the option?
+        stream
+            .set_nodelay(true)
+            .expect("setting SO_NODELAY for socket");
+
         let (read_half, write_half) = stream.into_split();
         let (cancel, incoming, outgoing) = new_encrypted_connection_task(
             read_half,

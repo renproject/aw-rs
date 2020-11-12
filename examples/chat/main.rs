@@ -38,7 +38,7 @@ async fn main() {
     let will_pull = move |header: &Header| {
         header.to == aw::id_from_pubkey(&own_pubkey) || header.to == GOSSIP_PEER_ID
     };
-    let (aw_fut, conn_manager, aw_in, mut aw_out) = aw::new_aw_task(
+    let (aw_fut, conn_manager, _port, aw_in, mut aw_out) = aw::new_aw_task(
         keypair.clone(),
         port,
         will_pull,
@@ -47,7 +47,8 @@ async fn main() {
         max_data_len,
         buffer_size,
         alpha,
-    );
+    )
+    .expect("creating aw task");
     let aw_handle = tokio::spawn(aw_fut);
 
     let mut screen = ScreenText::new();
