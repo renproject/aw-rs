@@ -8,10 +8,7 @@ use std::convert::TryInto;
 use std::net::SocketAddr;
 use std::num::TryFromIntError;
 use tokio::io::{self, AsyncReadExt, AsyncWriteExt};
-use tokio::net::{
-    tcp::{OwnedReadHalf, OwnedWriteHalf},
-    TcpStream,
-};
+use tokio::net::TcpStream;
 use tokio::sync::{
     mpsc::{self, error::SendError},
     oneshot::{self, error::RecvError},
@@ -23,8 +20,7 @@ mod encode;
 use encode::{NONCE_SIZE, TAG_SIZE};
 
 pub fn new_encrypted_connection_task<T: SynDecider + Send + 'static>(
-    read_half: OwnedReadHalf,
-    write_half: OwnedWriteHalf,
+    stream: TcpStream,
     pubkey: Public,
     cipher: Aes256Gcm,
     max_header_len: usize,
@@ -39,6 +35,7 @@ pub fn new_encrypted_connection_task<T: SynDecider + Send + 'static>(
     let (cancel_tx, cancel_rx) = oneshot::channel();
     let (incoming_tx, incoming_rx) = mpsc::channel(buffer_size);
     let (outgoing_tx, outgoing_rx) = mpsc::channel(buffer_size);
+    let (read_half, write_half) = stream.into_split();
     let read_fut = read_into_sender(
         pubkey,
         cipher.clone(),
@@ -48,7 +45,7 @@ pub fn new_encrypted_connection_task<T: SynDecider + Send + 'static>(
         incoming_tx,
         decider,
     );
-    let write_fut = write_from_receiver(cipher.clone(), write_half, outgoing_rx);
+    let write_fut = write_from_receiver(cipher, write_half, outgoing_rx);
     tokio::spawn(async {
         tokio::select! {
             _ = read_fut => (),
@@ -207,9 +204,9 @@ impl From<aead::Error> for WriteError {
 
 pub type SendPair = (Message, oneshot::Sender<Result<(), WriteError>>);
 
-async fn write_from_receiver(
+async fn write_from_receiver<W: AsyncWriteExt + Unpin>(
     cipher: Aes256Gcm,
-    mut write_half: OwnedWriteHalf,
+    mut write_half: W,
     mut receiver: mpsc::Receiver<SendPair>,
 ) {
     while let Some((msg, responder)) = receiver.recv().await {
@@ -222,24 +219,26 @@ async fn write_from_receiver(
                     Err(e) => Err(WriteError::from(e)),
                 }
             }
-            Message::Syn(header, value) => {
-                // TODO(ross): Clean this up.
-                let header = header.to_bytes();
-                let mut buf = vec![0u8; 4 + aes256gcm_encrypted_len!(header.len())];
-                let res1 = match encode::length_and_aes_encode(&mut buf, &header, &cipher) {
-                    Ok(()) => write_half.write_all(&buf).await.map_err(WriteError::Write),
-                    Err(e) => Err(WriteError::from(e)),
-                };
-                let mut buf = vec![0u8; 4 + aes256gcm_encrypted_len!(value.len())];
-                let res2 = match encode::length_and_aes_encode(&mut buf, &value, &cipher) {
-                    Ok(()) => write_half.write_all(&buf).await.map_err(WriteError::Write),
-                    Err(e) => Err(WriteError::from(e)),
-                };
-                res1.and(res2)
-            }
+            Message::Syn(header, value) => write_syn(&cipher, &mut write_half, header, value).await,
         };
         responder.send(response).ok();
     }
+}
+
+async fn write_syn<W: AsyncWriteExt + Unpin>(
+    cipher: &Aes256Gcm,
+    write_half: &mut W,
+    header: Header,
+    value: Vec<u8>,
+) -> Result<(), WriteError> {
+    let header = header.to_bytes();
+    let header_enc_len = 4 + aes256gcm_encrypted_len!(header.len());
+    let value_enc_len = 4 + aes256gcm_encrypted_len!(value.len());
+    let mut buf = vec![0u8; header_enc_len + value_enc_len];
+    let (header_buf, value_buf) = buf.split_at_mut(header_enc_len);
+    encode::length_and_aes_encode(header_buf, &header, &cipher)?;
+    encode::length_and_aes_encode(value_buf, &value, &cipher)?;
+    write_half.write_all(&buf).await.map_err(WriteError::Write)
 }
 
 pub struct Connection {
@@ -281,10 +280,8 @@ impl Connection {
             .set_nodelay(true)
             .expect("setting SO_NODELAY for socket");
 
-        let (read_half, write_half) = stream.into_split();
         let (cancel, incoming, outgoing) = new_encrypted_connection_task(
-            read_half,
-            write_half,
+            stream,
             pubkey,
             cipher,
             max_header_len,

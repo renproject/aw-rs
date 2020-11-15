@@ -169,17 +169,14 @@ mod tests {
             for receiver in recvs {
                 let (from, received_message) = receivers[receiver].recv().await.expect("receiving");
                 assert_eq!(received_message, message.to_vec());
-                if receiver == 0 {
-                    assert_eq!(&from, keypairs[1].public());
-                } else if 0 < receiver && receiver <= n - 1 {
-                    assert!(
+                match receiver {
+                    0 => assert_eq!(&from, keypairs[1].public()),
+                    r if 0 < r && r <= n - 1 => assert!(
                         &from == keypairs[receiver - 1].public()
                             || &from == keypairs[receiver + 1].public()
-                    );
-                } else if receiver == n - 1 {
-                    assert_eq!(&from, keypairs[n - 2].public());
-                } else {
-                    unreachable!()
+                    ),
+                    r if r == n - 1 => assert_eq!(&from, keypairs[n - 2].public()),
+                    _ => unreachable!(),
                 }
             }
         }
