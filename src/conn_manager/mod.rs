@@ -15,7 +15,7 @@ pub mod connection;
 pub mod peer_table;
 
 use connection::{ConnectionPool, SynDecider};
-use peer_table::PeerTable;
+use peer_table::{PeerTable, SignedAddress};
 
 pub struct ConnectionManager<T> {
     pool: ConnectionPool<T>,
@@ -27,12 +27,24 @@ impl<T> ConnectionManager<T> {
         Self { pool, table }
     }
 
-    pub fn add_peer(&mut self, pubkey: Public, addr: SocketAddr) {
-        self.table.add_peer(pubkey, addr);
+    pub fn add_unsigned_peer(&mut self, pubkey: Public, addr: SocketAddr) {
+        self.table.add_unsigned_peer(pubkey, addr);
+    }
+
+    pub fn add_signed_peer(&mut self, pubkey: Public, addr: SignedAddress) {
+        self.table.add_signed_peer(pubkey, addr);
     }
 
     pub fn num_peers(&self) -> usize {
         self.table.num_peers()
+    }
+
+    pub fn unsigned_peers(&self) -> impl Iterator<Item = (&Public, &SocketAddr)> {
+        self.table.unsigned_peers()
+    }
+
+    pub fn signed_peers(&self) -> impl Iterator<Item = (&Public, &SignedAddress)> {
+        self.table.signed_peers()
     }
 
     pub fn peers(&self) -> impl Iterator<Item = (&Public, &SocketAddr)> {
@@ -41,6 +53,16 @@ impl<T> ConnectionManager<T> {
 
     pub fn random_peer_subset(&self, n: usize) -> Vec<Public> {
         self.table.random_peer_subset(n)
+    }
+
+    pub fn random_signed_address_subset(&self, n: usize) -> Vec<SignedAddress> {
+        self.table.random_signed_address_subset(n)
+    }
+
+    pub fn has_connection_to_peer(&self, pubkey: &Public) -> bool {
+        let addr = self.table.peer_socket_addr(pubkey);
+        addr.map(|addr| self.pool.has_connection(addr))
+            .unwrap_or(false)
     }
 }
 
@@ -53,7 +75,7 @@ pub async fn try_send_peer<T: SynDecider + Clone + Send + 'static>(
         let mut conn_manager_lock = util::get_lock(conn_manager);
         conn_manager_lock
             .table
-            .peer_addr(peer)
+            .peer_socket_addr(peer)
             .cloned()
             .and_then(|addr| {
                 conn_manager_lock
@@ -207,7 +229,7 @@ async fn add_to_pool_with_reuse<T: SynDecider + Clone + Send + 'static>(
     let mut conn_manager = util::get_lock(&conn_manager);
     if keep_alive {
         let addr = stream.peer_addr().expect("TODO");
-        conn_manager.table.add_peer(peer_pubkey, addr);
+        conn_manager.table.add_unsigned_peer(peer_pubkey, addr);
         conn_manager
             .pool
             .add_connection(stream, peer_pubkey, key)
@@ -245,7 +267,7 @@ mod tests {
         let key = rand::random();
 
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), port);
-        let existing_peer = table.add_peer(peer_pubkey, addr);
+        let existing_peer = table.add_unsigned_peer(peer_pubkey, addr);
         assert!(existing_peer.is_none());
 
         let stream = std::net::TcpStream::connect(addr).unwrap();

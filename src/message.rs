@@ -12,12 +12,16 @@ pub const V1: Version = 1;
 pub const VAR_PUSH: u16 = 0;
 pub const VAR_PULL: u16 = 1;
 pub const VAR_SYN: u16 = 2;
+pub const VAR_PING: u16 = 3;
+pub const VAR_PONG: u16 = 4;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Variant {
     Push,
     Pull,
     Syn,
+    Ping,
+    Pong,
 }
 
 impl From<Variant> for u16 {
@@ -27,6 +31,8 @@ impl From<Variant> for u16 {
             Push => VAR_PUSH,
             Pull => VAR_PULL,
             Syn => VAR_SYN,
+            Ping => VAR_PING,
+            Pong => VAR_PONG,
         }
     }
 }
@@ -53,6 +59,8 @@ impl TryFrom<u16> for Variant {
             VAR_PUSH => Ok(Push),
             VAR_PULL => Ok(Pull),
             VAR_SYN => Ok(Syn),
+            VAR_PING => Ok(Ping),
+            VAR_PONG => Ok(Pong),
             _ => Err(U16TryFromVariantError::InvalidVariant),
         }
     }
@@ -75,7 +83,7 @@ pub struct Header {
     pub version: Version,
     pub variant: Variant,
     pub to: PeerID,
-    pub key: Vec<u8>,
+    pub data: Vec<u8>,
 }
 
 #[derive(Debug)]
@@ -87,12 +95,12 @@ pub enum Error {
 }
 
 impl Header {
-    pub fn new(version: Version, variant: Variant, to: PeerID, key: Vec<u8>) -> Self {
+    pub fn new(version: Version, variant: Variant, to: PeerID, data: Vec<u8>) -> Self {
         Self {
             version,
             variant,
             to,
-            key,
+            data,
         }
     }
 
@@ -123,7 +131,7 @@ impl Header {
                     version,
                     variant,
                     to,
-                    key: vec.split_off(36),
+                    data: vec.split_off(36),
                 })
             }
             _ => Err(UnsupportedVersion),
@@ -136,12 +144,12 @@ impl Header {
             version,
             variant,
             to,
-            key,
+            data,
         } = self;
         bytes.extend_from_slice(&version.to_be_bytes());
         bytes.extend_from_slice(&u16::from(variant).to_be_bytes());
         bytes.extend_from_slice(&to);
-        bytes.extend_from_slice(key.as_slice());
+        bytes.extend_from_slice(data.as_slice());
         bytes
     }
 }

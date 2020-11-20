@@ -199,6 +199,7 @@ async fn parse_command(
             let property = words.next().ok_or(InvalidArguments)?;
             match property {
                 "pubkey" => Ok(format!("{:x?}", keypair.public())),
+                "id" => Ok(format!("{}", base64::encode(keypair.public().as_bytes()))),
                 "address" => Ok(format!("{:?}", keypair.address())),
                 "peers" => {
                     let lock = util::get_lock(conn_manager);
@@ -227,7 +228,6 @@ async fn parse_command(
                     );
                     Ok(string)
                 }
-                "id" => Ok(format!("{:?}", aw::id_from_pubkey(keypair.public()))),
                 _ => Err(InvalidArguments),
             }
         }
@@ -246,7 +246,7 @@ async fn parse_command(
                 .next()
                 .ok_or(InvalidArguments)
                 .and_then(|s| SocketAddr::from_str(s).map_err(|_| InvalidArguments))?;
-            conn_manager_lock.add_peer(pubkey, addr);
+            conn_manager_lock.add_unsigned_peer(pubkey, addr);
             Ok("peer added!".to_owned())
         }
         "connect" => {

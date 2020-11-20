@@ -139,7 +139,7 @@ where
                         message::V1,
                         Variant::Push,
                         header.to,
-                        header.key.clone(),
+                        header.data.clone(),
                     ));
                     // TODO(ross): Ideally we should keep trying to send to peers until we are
                     // reasonably confident that `alpha` of them will receive the message;
@@ -188,21 +188,21 @@ where
         Message::Header(header) => match header.variant {
             Variant::Push => {
                 let mut received = util::get_lock(&received);
-                if received.contains_key(header.key.as_slice()) {
+                if received.contains_key(header.data.as_slice()) {
                     // If the key is already in the map then either we are the originator of the
                     // message, or we have already received the `Push` header and possibly sent out
                     // a corresponding `Pull`. In either case, we do not want to pull again.
                     None
                 } else {
-                    received.insert(header.key.clone(), None);
+                    received.insert(header.data.clone(), None);
                     if will_pull(&header) {
                         let mut requested = util::get_lock(&requested);
-                        requested.insert(header.key.clone(), ());
+                        requested.insert(header.data.clone(), ());
                         Some(Response::Network(Message::Header(Header::new(
                             message::V1,
                             Variant::Pull,
                             header.to,
-                            header.key,
+                            header.data,
                         ))))
                     } else {
                         None
@@ -211,8 +211,8 @@ where
             }
             Variant::Pull => {
                 let received = util::get_lock(&received);
-                if let Some(Some(msg)) = received.get(header.key.as_slice()) {
-                    let header = Header::new(message::V1, Variant::Syn, header.to, header.key);
+                if let Some(Some(msg)) = received.get(header.data.as_slice()) {
+                    let header = Header::new(message::V1, Variant::Syn, header.to, header.data);
                     Some(Response::Network(Message::Syn(header, msg.clone())))
                 } else {
                     None
@@ -224,16 +224,22 @@ where
                 // here?
                 todo!()
             }
+            Variant::Ping | Variant::Pong => {
+                // TODO(ross): The fact that we should never have to handle this case probably
+                // suggests that we should have some way using types so that we never need to
+                // consider anything that the gossip logic doesn't care about.
+                unreachable!()
+            }
         },
         Message::Syn(header, msg) => {
             let mut requested = util::get_lock(&requested);
             let mut received = util::get_lock(&received);
-            if requested.remove(header.key.as_slice()).is_some() {
+            if requested.remove(header.data.as_slice()).is_some() {
                 // TODO(ross): The message was not actually requested but we are receiving it
                 // anyway. What should we do here?
             }
             received
-                .get_mut(header.key.as_slice())
+                .get_mut(header.data.as_slice())
                 .and_then(|value| value.replace(msg.clone()));
             Some(Response::User(msg))
         }
@@ -248,7 +254,7 @@ pub struct Decider {
 impl SynDecider for Decider {
     fn syn_requested(&mut self, msg: &Header) -> bool {
         let requested = util::get_lock(&self.requested);
-        requested.contains_key(msg.key.as_slice())
+        requested.contains_key(msg.data.as_slice())
     }
 }
 

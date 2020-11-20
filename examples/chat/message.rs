@@ -51,6 +51,7 @@ impl TryFrom<&[u8]> for Message {
 pub fn key(msg: &[u8]) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(msg);
+    /*
     hasher.update(
         &std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -58,5 +59,6 @@ pub fn key(msg: &[u8]) -> [u8; 32] {
             .as_secs()
             .to_be_bytes(),
     );
+    */
     hasher.finalize().into()
 }

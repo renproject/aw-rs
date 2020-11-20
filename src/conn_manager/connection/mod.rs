@@ -418,7 +418,7 @@ pub enum PoolError {
     PeerAddr(std::io::Error),
 }
 
-impl<T: SynDecider + Clone + Send + 'static> ConnectionPool<T> {
+impl<T> ConnectionPool<T> {
     pub fn new_with_max_connections_allocated(
         max_connections: usize,
         max_header_len: usize,
@@ -442,32 +442,6 @@ impl<T: SynDecider + Clone + Send + 'static> ConnectionPool<T> {
         )
     }
 
-    pub fn add_connection(
-        &mut self,
-        stream: TcpStream,
-        pubkey: Public,
-        key: [u8; 32],
-    ) -> Result<Option<Connection>, PoolError> {
-        use PoolError::*;
-
-        if self.connections.len() >= self.max_connections {
-            return Err(TooManyConnections);
-        }
-        let peer_addr = stream.peer_addr().map_err(PeerAddr)?;
-        let mut conn = Connection::new(
-            key,
-            pubkey,
-            self.max_header_len,
-            self.max_data_len,
-            self.buffer_size,
-            stream,
-            self.decider.clone(),
-        );
-        let not_drained = conn.drain_into(self.reads_ref.clone());
-        assert!(not_drained);
-        Ok(self.connections.insert(peer_addr, conn))
-    }
-
     // NOTE(ross): Currently this could be called while another task is writing to the connection,
     // which may not necessarily cause a panic or anything but would probably be unexpected
     // behvaviour.
@@ -477,6 +451,10 @@ impl<T: SynDecider + Clone + Send + 'static> ConnectionPool<T> {
 
     pub fn num_connections(&self) -> usize {
         self.connections.len()
+    }
+
+    pub fn has_connection(&self, addr: &SocketAddr) -> bool {
+        self.connections.contains_key(addr)
     }
 
     pub fn is_full(&self) -> bool {
@@ -515,5 +493,33 @@ impl<T: SynDecider + Clone + Send + 'static> ConnectionPool<T> {
 
     pub fn clean_up_pool(&mut self) {
         self.connections.retain(|_, conn| !conn.is_closed());
+    }
+}
+
+impl<T: SynDecider + Clone + Send + 'static> ConnectionPool<T> {
+    pub fn add_connection(
+        &mut self,
+        stream: TcpStream,
+        pubkey: Public,
+        key: [u8; 32],
+    ) -> Result<Option<Connection>, PoolError> {
+        use PoolError::*;
+
+        if self.connections.len() >= self.max_connections {
+            return Err(TooManyConnections);
+        }
+        let peer_addr = stream.peer_addr().map_err(PeerAddr)?;
+        let mut conn = Connection::new(
+            key,
+            pubkey,
+            self.max_header_len,
+            self.max_data_len,
+            self.buffer_size,
+            stream,
+            self.decider.clone(),
+        );
+        let not_drained = conn.drain_into(self.reads_ref.clone());
+        assert!(not_drained);
+        Ok(self.connections.insert(peer_addr, conn))
     }
 }

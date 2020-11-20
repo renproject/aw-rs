@@ -9,6 +9,7 @@ pub mod conn_manager;
 pub mod gossip;
 pub mod handshake;
 pub mod message;
+pub mod peer;
 pub mod util;
 
 use conn_manager::{connection::ConnectionPool, peer_table::PeerTable};
@@ -74,9 +75,8 @@ where
                 break;
             }
         }
-        Result::<(), ()>::Err(())
-    }
-    .map(|res| res.map_err(|_| Error::Internal));
+        Result::<(), _>::Err(Error::Internal)
+    };
 
     let (port, listen_fut) = conn_manager::listen_for_peers(
         conn_manager.clone(),
