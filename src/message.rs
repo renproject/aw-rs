@@ -9,11 +9,11 @@ pub type Version = u16;
 
 pub const V1: Version = 1;
 
-pub const VAR_PUSH: u16 = 0;
-pub const VAR_PULL: u16 = 1;
-pub const VAR_SYN: u16 = 2;
-pub const VAR_PING: u16 = 3;
-pub const VAR_PONG: u16 = 4;
+pub const VAR_PUSH: u16 = 1;
+pub const VAR_PULL: u16 = 2;
+pub const VAR_SYN: u16 = 3;
+pub const VAR_PING: u16 = 4;
+pub const VAR_PONG: u16 = 5;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Variant {
