@@ -7,34 +7,45 @@ use std::collections::HashMap;
 use std::convert::TryInto;
 use std::net::SocketAddr;
 use std::num::TryFromIntError;
+use std::time::{Duration, Instant};
 use tokio::io::{self, AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::{
     mpsc::{self, error::SendError},
     oneshot::{self, error::RecvError},
 };
+use tokio::time;
 
 #[macro_use]
 mod encode;
 
 use encode::{NONCE_SIZE, TAG_SIZE};
 
-pub fn new_encrypted_connection_task<T: SynDecider + Send + 'static>(
+enum TTLOrCancel {
+    TTL(Duration),
+    Cancel,
+}
+
+fn new_encrypted_connection_task<T: SynDecider + Send + 'static>(
     stream: TcpStream,
     pubkey: Public,
     cipher: Aes256Gcm,
+    ttl: Option<Duration>,
     max_header_len: usize,
     max_data_len: usize,
     buffer_size: usize,
     decider: T,
 ) -> (
     oneshot::Sender<()>,
+    mpsc::Sender<TTLOrCancel>,
     mpsc::Receiver<(Public, Message)>,
     mpsc::Sender<SendPair>,
 ) {
     let (cancel_tx, cancel_rx) = oneshot::channel();
+    let (mut timeout_cancel_tx, timeout_cancel_rx) = oneshot::channel();
     let (incoming_tx, incoming_rx) = mpsc::channel(buffer_size);
     let (outgoing_tx, outgoing_rx) = mpsc::channel(buffer_size);
+    let (timeout_tx, mut timeout_rx) = mpsc::channel(buffer_size);
     let (read_half, write_half) = stream.into_split();
     let read_fut = read_into_sender(
         pubkey,
@@ -46,15 +57,66 @@ pub fn new_encrypted_connection_task<T: SynDecider + Send + 'static>(
         decider,
     );
     let write_fut = write_from_receiver(cipher, write_half, outgoing_rx);
-    tokio::spawn(async {
+    let fut = async {
         tokio::select! {
             _ = read_fut => (),
             _ = write_fut => (),
             _ = cancel_rx => (),
+            // NOTE(ross): I think that the only time that a one shot result will be an error is if
+            // the sender has been dropped/closed. In our context, this means that the time out is
+            // no longer relevant, and so we don't want the select to complete in this case.
+            Ok(_) = timeout_cancel_rx => (),
         }
-    });
+    };
+    match ttl {
+        Some(ttl) => {
+            let mut timeout = time::delay_for(ttl);
+            let timeout_fut = async move {
+                tokio::pin!(fut);
+                let mut enable_timer = true;
+                loop {
+                    tokio::select! {
+                        _ = &mut timeout, if enable_timer => {
+                            timeout_cancel_tx.send(()).ok();
+                            break;
+                        },
+                        _ = timeout_cancel_tx.closed() => break,
+                        Some(ttl_or_cancel) = timeout_rx.recv() => {
+                            match ttl_or_cancel {
+                                TTLOrCancel::TTL(dur) => {
+                                    match Instant::now().checked_add(dur) {
+                                        Some(new_deadline) => {
+                                            let new_deadline = tokio::time::Instant::from_std(new_deadline);
+                                            if new_deadline > timeout.deadline() {
+                                                timeout.reset(new_deadline);
+                                            }
+                                        },
+                                        None => {
+                                            // TODO(ross): This occurs when the duration added to
+                                            // the current time cannot be represented in the data
+                                            // structure, which should probably never happen in our
+                                            // code.
+                                        }
+                                    }
+                                }
+                                TTLOrCancel::Cancel => {
+                                    enable_timer = false;
+                                    timeout_rx.close();
+                                }
+                            }
+                        },
+                        _ = &mut fut => break,
+                    }
+                }
+            };
+            tokio::spawn(timeout_fut);
+        }
+        None => {
+            tokio::spawn(fut);
+        }
+    }
 
-    (cancel_tx, incoming_rx, outgoing_tx)
+    (cancel_tx, timeout_tx, incoming_rx, outgoing_tx)
 }
 
 #[derive(Debug)]
@@ -245,6 +307,7 @@ pub struct Connection {
     reader: Option<mpsc::Receiver<(Public, Message)>>,
     writer: ConnectionWriter,
     cancel: oneshot::Sender<()>,
+    timeout_update: mpsc::Sender<TTLOrCancel>,
 }
 
 #[derive(Debug)]
@@ -261,6 +324,7 @@ impl Connection {
     pub fn new<T: SynDecider + Send + 'static>(
         key: [u8; 32],
         pubkey: Public,
+        ttl: Option<Duration>,
         max_header_len: usize,
         max_data_len: usize,
         buffer_size: usize,
@@ -280,10 +344,11 @@ impl Connection {
             .set_nodelay(true)
             .expect("setting SO_NODELAY for socket");
 
-        let (cancel, incoming, outgoing) = new_encrypted_connection_task(
+        let (cancel, timeout_update, incoming, outgoing) = new_encrypted_connection_task(
             stream,
             pubkey,
             cipher,
+            ttl,
             max_header_len,
             max_data_len,
             buffer_size,
@@ -293,6 +358,7 @@ impl Connection {
             reader: Some(incoming),
             writer: ConnectionWriter::new(outgoing),
             cancel,
+            timeout_update,
         }
     }
 
@@ -310,6 +376,33 @@ impl Connection {
 
     pub async fn write(&mut self, msg: Message) -> Result<(), ConnectionWriteError> {
         self.writer.write(msg).await
+    }
+
+    pub fn update_timeout(&mut self, ttl: Duration) {
+        match self.timeout_update.try_send(TTLOrCancel::TTL(ttl)) {
+            Ok(_) => (),
+            Err(mpsc::error::TrySendError::<TTLOrCancel>::Closed(_)) => {
+                // NOTE(ross): In this case the receiver is closed which *should* mean that either
+                // the socket is long lived or that the socket is closed.
+            }
+            Err(mpsc::error::TrySendError::<TTLOrCancel>::Full(_)) => {
+                // TODO(ross): In this case the channel buffer is full. This could happen if there
+                // are many attempts to update the timeout (unlikely) and the system is under heavy
+                // load. This seems like a situation that probably shouldn't occur, but we should
+                // think about what a caller of the function might want to do in this case, and if
+                // there is something we should return something that will notify the user.
+            }
+        }
+    }
+
+    pub fn make_long_lived(&mut self) -> bool {
+        if let Err(mpsc::error::TrySendError::<TTLOrCancel>::Full(_)) =
+            self.timeout_update.try_send(TTLOrCancel::Cancel)
+        {
+            false
+        } else {
+            true
+        }
     }
 
     pub fn drain_into(&mut self, mut sink: mpsc::Sender<(Public, Message)>) -> bool {
@@ -512,6 +605,7 @@ impl<T: SynDecider + Clone + Send + 'static> ConnectionPool<T> {
         let mut conn = Connection::new(
             key,
             pubkey,
+            None, // FIXME(ross)
             self.max_header_len,
             self.max_data_len,
             self.buffer_size,
@@ -521,5 +615,99 @@ impl<T: SynDecider + Clone + Send + 'static> ConnectionPool<T> {
         let not_drained = conn.drain_into(self.reads_ref.clone());
         assert!(not_drained);
         Ok(self.connections.insert(peer_addr, conn))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::message::{GOSSIP_PEER_ID, V1};
+    use parity_crypto::publickey::{Generator, Random};
+    use tokio::net::TcpListener;
+
+    struct DummyDecider {}
+
+    impl SynDecider for DummyDecider {
+        fn syn_requested(&mut self, _: &Header) -> bool {
+            true
+        }
+    }
+
+    async fn default_client_server_connections(
+        client_ttl: Option<Duration>,
+        server_ttl: Option<Duration>,
+    ) -> (Connection, Connection) {
+        let max_header_len = 1024;
+        let max_data_len = 1024;
+        let buffer_size = 100;
+
+        let key = rand::random();
+        let (client_keypair, server_keypair) = (Random.generate(), Random.generate());
+
+        let mut listener = TcpListener::bind("0.0.0.0:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let client_stream = TcpStream::connect(format!("127.0.0.1:{}", port))
+            .await
+            .unwrap();
+        let (server_stream, _) = listener.accept().await.unwrap();
+
+        let client_connection = Connection::new(
+            key,
+            *client_keypair.public(),
+            client_ttl,
+            max_header_len,
+            max_data_len,
+            buffer_size,
+            client_stream,
+            DummyDecider {},
+        );
+        let server_connection = Connection::new(
+            key,
+            *server_keypair.public(),
+            server_ttl,
+            max_header_len,
+            max_data_len,
+            buffer_size,
+            server_stream,
+            DummyDecider {},
+        );
+
+        (client_connection, server_connection)
+    }
+
+    #[tokio::test]
+    async fn short_lived_connections_expire() {
+        let ttl = Duration::from_millis(10);
+        let (mut client_connection, server_connection) =
+            default_client_server_connections(Some(ttl), None).await;
+
+        // Messages should be able to be sent while the connection is open.
+        let msg = Message::Header(Header::new(V1, Variant::Push, GOSSIP_PEER_ID, vec![1, 2]));
+        client_connection.write(msg.clone()).await.unwrap();
+        let (_, received_msg) = server_connection.reader.unwrap().recv().await.unwrap();
+        assert_eq!(received_msg, msg);
+
+        // After the TTL has expired, the connection should be closed.
+        tokio::time::delay_for(ttl).await;
+        assert!(client_connection.is_closed());
+    }
+
+    #[tokio::test]
+    async fn short_lived_connections_can_be_made_long_lived() {
+        let ttl = Duration::from_millis(2);
+        let (mut client_connection, server_connection) =
+            default_client_server_connections(Some(ttl), None).await;
+
+        // Make the connection long lived.
+        assert!(client_connection.make_long_lived());
+
+        // Messages should now be able to be sent after the TTL that was originally set for the
+        // short lived connection.
+        tokio::time::delay_for(10 * ttl).await;
+        assert!(!client_connection.is_closed());
+        let msg = Message::Header(Header::new(V1, Variant::Push, GOSSIP_PEER_ID, vec![1, 2]));
+        client_connection.write(msg.clone()).await.unwrap();
+        let (_, received_msg) = server_connection.reader.unwrap().recv().await.unwrap();
+        assert_eq!(received_msg, msg);
     }
 }

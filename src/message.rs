@@ -72,13 +72,13 @@ pub enum To {
     Gossip,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Message {
     Header(Header),
     Syn(Header, Vec<u8>),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Header {
     pub version: Version,
     pub variant: Variant,

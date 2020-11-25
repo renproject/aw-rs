@@ -16,13 +16,6 @@ pub fn get_lock<'a, T>(mutex: &'a Mutex<T>) -> MutexGuard<'a, T> {
     }
 }
 
-pub fn mutex_into_inner<T>(mutex: Mutex<T>) -> T {
-    match mutex.into_inner() {
-        Ok(inner) => inner,
-        Err(e) => e.into_inner(),
-    }
-}
-
 pub struct ChannelRW {
     reader: Receiver<Vec<u8>>,
     writer: Sender<Vec<u8>>,
