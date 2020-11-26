@@ -260,7 +260,7 @@ async fn parse_command(
                 .next()
                 .ok_or(InvalidArguments)
                 .and_then(|s| SocketAddr::from_str(s).map_err(|_| InvalidArguments))?;
-            conn_manager::establish_connection(conn_manager, keypair, &pubkey, addr)
+            conn_manager::establish_connection(conn_manager, keypair, &pubkey, addr, None)
                 .await
                 .map_err(|_| CommandFailed)?;
             Ok("connected to peer!".to_owned())

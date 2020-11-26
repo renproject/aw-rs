@@ -3,7 +3,7 @@ use crate::conn_manager::{
 };
 use crate::message::{Header, Message, Variant, UNUSED_PEER_ID, V1};
 use futures::Future;
-use parity_crypto::publickey::Public;
+use parity_crypto::publickey::{KeyPair, Public};
 use std::convert::TryFrom;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -18,19 +18,28 @@ pub enum Error {}
 
 pub fn peer_discovery_task<T: SynDecider + Clone + Send + 'static>(
     conn_manager: Arc<Mutex<ConnectionManager<T>>>,
-    own_pubkey: Public,
+    keypair: KeyPair,
     own_addr: Option<SignedAddress>,
     ping_interval: Duration,
     ping_alpha: usize,
     peer_alpha: usize,
+    ping_ttl: Duration,
     buffer_size: usize,
 ) -> (
     impl Future<Output = ()>,
     impl Future<Output = ()>,
     mpsc::Sender<(Public, Message)>,
 ) {
+    let own_pubkey = *keypair.public();
     let (sender, receiver) = mpsc::channel(buffer_size);
-    let ping_sender_fut = ping_sender(conn_manager.clone(), own_addr, ping_interval, ping_alpha);
+    let ping_sender_fut = ping_sender(
+        conn_manager.clone(),
+        keypair,
+        own_addr,
+        ping_interval,
+        ping_alpha,
+        ping_ttl,
+    );
     let ping_handler_fut = ping_handler(conn_manager, own_pubkey, receiver, peer_alpha);
 
     (ping_sender_fut, ping_handler_fut, sender)
@@ -38,9 +47,11 @@ pub fn peer_discovery_task<T: SynDecider + Clone + Send + 'static>(
 
 async fn ping_sender<T: SynDecider + Clone + Send + 'static>(
     conn_manager: Arc<Mutex<ConnectionManager<T>>>,
+    keypair: KeyPair,
     own_addr: Option<SignedAddress>,
     ping_interval: Duration,
     ping_alpha: usize,
+    ping_ttl: Duration,
 ) {
     let mut ping_timer = time::interval(ping_interval);
     loop {
@@ -56,11 +67,15 @@ async fn ping_sender<T: SynDecider + Clone + Send + 'static>(
             let conn_manager = conn_manager.lock().unwrap();
             conn_manager.random_peer_subset(ping_alpha)
         };
-        futures::future::join_all(
-            peers
-                .iter()
-                .map(|peer| conn_manager::try_send_peer(&conn_manager, &peer, ping.clone())),
-        )
+        futures::future::join_all(peers.iter().map(|peer| {
+            conn_manager::send_with_establish(
+                &conn_manager,
+                &keypair,
+                &peer,
+                ping.clone(),
+                Some(ping_ttl),
+            )
+        }))
         .await;
     }
 }
@@ -188,6 +203,62 @@ mod tests {
     use parity_crypto::publickey::{Generator, KeyPair, Random};
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
+    fn create_peer() -> (
+        KeyPair,
+        u16,
+        Arc<Mutex<ConnectionManager<Decider>>>,
+        impl Future<Output = ()>,
+    ) {
+        let max_connections = 100;
+        let max_header_len = 1024;
+        let max_data_len = 1024;
+        let buffer_size = 100;
+        let ping_interval = Duration::from_millis(1);
+        let ping_alpha = 3;
+        let ping_ttl = Duration::from_secs(10);
+        let peer_alpha = 3;
+
+        let keypair = Random.generate();
+        let addr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+
+        let decider = Decider::new();
+        let (pool, mut pool_receiver) = ConnectionPool::new_with_max_connections_allocated(
+            max_connections,
+            max_header_len,
+            max_data_len,
+            buffer_size,
+            decider,
+        );
+        let table = PeerTable::new();
+        let conn_manager = Arc::new(Mutex::new(ConnectionManager::new(pool, table)));
+        let (port, listen_fut) =
+            conn_manager::listen_for_peers(conn_manager.clone(), keypair.clone(), addr, 0).unwrap();
+        let signed_addr =
+            SignedAddress::new(SocketAddr::new(addr, port), keypair.secret()).unwrap();
+
+        let (pinger_task, handler_task, mut ping_pong_sender) = peer_discovery_task(
+            conn_manager.clone(),
+            keypair.clone(),
+            Some(signed_addr),
+            ping_interval,
+            ping_alpha,
+            peer_alpha,
+            ping_ttl,
+            buffer_size,
+        );
+
+        let cm_to_pinger_fut = async move {
+            while let Some(msg) = pool_receiver.recv().await {
+                if ping_pong_sender.send(msg).await.is_err() {
+                    break;
+                }
+            }
+        };
+
+        let fut = futures::future::join4(listen_fut, pinger_task, handler_task, cm_to_pinger_fut);
+        (keypair, port, conn_manager, fut.map(drop))
+    }
+
     #[tokio::test]
     async fn peer_discovery() {
         let n = 5;
@@ -215,6 +286,7 @@ mod tests {
                 &keypairs[i],
                 keypairs[i + 1].public(),
                 SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), ports[i + 1]),
+                None,
             )
         }))
         .await
@@ -237,59 +309,5 @@ mod tests {
             }
         };
         check_fut.await;
-    }
-
-    fn create_peer() -> (
-        KeyPair,
-        u16,
-        Arc<Mutex<ConnectionManager<Decider>>>,
-        impl Future<Output = ()>,
-    ) {
-        let max_connections = 100;
-        let max_header_len = 1024;
-        let max_data_len = 1024;
-        let buffer_size = 100;
-        let ping_interval = Duration::from_millis(1);
-        let ping_alpha = 3;
-        let peer_alpha = 3;
-
-        let keypair = Random.generate();
-        let addr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
-
-        let decider = Decider::new();
-        let (pool, mut pool_receiver) = ConnectionPool::new_with_max_connections_allocated(
-            max_connections,
-            max_header_len,
-            max_data_len,
-            buffer_size,
-            decider,
-        );
-        let table = PeerTable::new();
-        let conn_manager = Arc::new(Mutex::new(ConnectionManager::new(pool, table)));
-        let (port, listen_fut) =
-            conn_manager::listen_for_peers(conn_manager.clone(), keypair.clone(), addr, 0).unwrap();
-        let signed_addr =
-            SignedAddress::new(SocketAddr::new(addr, port), keypair.secret()).unwrap();
-
-        let (pinger_task, handler_task, mut ping_pong_sender) = peer_discovery_task(
-            conn_manager.clone(),
-            *keypair.public(),
-            Some(signed_addr),
-            ping_interval,
-            ping_alpha,
-            peer_alpha,
-            buffer_size,
-        );
-
-        let cm_to_pinger_fut = async move {
-            while let Some(msg) = pool_receiver.recv().await {
-                if ping_pong_sender.send(msg).await.is_err() {
-                    break;
-                }
-            }
-        };
-
-        let fut = futures::future::join4(listen_fut, pinger_task, handler_task, cm_to_pinger_fut);
-        (keypair, port, conn_manager, fut.map(drop))
     }
 }

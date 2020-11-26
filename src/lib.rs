@@ -154,6 +154,7 @@ mod tests {
                 &keypairs[i],
                 keypairs[i + 1].public(),
                 SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), ports[i + 1]),
+                None,
             )
         }))
         .await

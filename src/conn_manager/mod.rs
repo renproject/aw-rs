@@ -1,4 +1,4 @@
-use crate::conn_manager::connection::Connection;
+use crate::conn_manager::connection::{Connection, ConnectionWriter};
 use crate::handshake;
 use crate::message::Message;
 use crate::util::{self, SharedPtr};
@@ -64,6 +64,13 @@ impl<T> ConnectionManager<T> {
         addr.map(|addr| self.pool.has_connection(addr))
             .unwrap_or(false)
     }
+
+    pub fn peer_connection(&mut self, pubkey: &Public) -> Option<ConnectionWriter> {
+        self.table
+            .peer_socket_addr(pubkey)
+            .cloned()
+            .and_then(|addr| self.pool.get_connection(&addr).map(Connection::writer))
+    }
 }
 
 pub async fn try_send_peer<T: SynDecider + Clone + Send + 'static>(
@@ -73,22 +80,58 @@ pub async fn try_send_peer<T: SynDecider + Clone + Send + 'static>(
 ) -> Result<(), Error> {
     let writer = {
         let mut conn_manager_lock = util::get_lock(conn_manager);
-        conn_manager_lock
-            .table
-            .peer_socket_addr(peer)
-            .cloned()
-            .and_then(|addr| {
-                conn_manager_lock
-                    .pool
-                    .get_connection_mut(&addr)
-                    .map(|conn| conn.writer())
-            })
+        conn_manager_lock.peer_connection(peer)
     };
     if let Some(mut writer) = writer {
         writer.write(msg).await.map_err(Error::Connection)
     } else {
         Err(Error::ConnectionDoesNotExist)
     }
+}
+
+pub async fn send_with_establish<T: SynDecider + Clone + Send + 'static>(
+    conn_manager: &SharedPtr<ConnectionManager<T>>,
+    keypair: &KeyPair,
+    peer: &Public,
+    msg: Message,
+    ttl: Option<Duration>,
+) -> Result<(), Error> {
+    let (addr, maybe_writer) = {
+        let mut conn_manager = conn_manager.lock().unwrap();
+        let addr = conn_manager
+            .table
+            .peer_socket_addr(peer)
+            .cloned()
+            .ok_or(Error::PeerDoesNotExist)?;
+
+        let maybe_writer = conn_manager
+            .pool
+            .get_connection(&addr)
+            .map(Connection::writer);
+        (addr, maybe_writer)
+    };
+
+    let mut writer = match maybe_writer {
+        None => {
+            // TODO(ross): Do we want to have a timeout for the completion of this future? The
+            // caller of the function can put a timeout on the whole call, but maybe being able to
+            // set a timeout for this specific part is more useful.
+            establish_connection(conn_manager, keypair, peer, addr, ttl).await?;
+
+            // TODO(ross): Since establishing a connection and getting it from the pool are two
+            // different operations, it is possible that between these two calls the connection
+            // will acually be removed from the pool, which will cause the following to panic. This
+            // should be addressed. Two possiblities:
+            // - Return the connection from the call to `establish_connection` along with a lock.
+            // - Retructure the weird ConnectionManager struct so that this problem doesn't
+            // manifest.
+            let mut conn_manager = conn_manager.lock().unwrap();
+            conn_manager.peer_connection(peer).expect("TODO")
+        }
+        Some(writer) => writer,
+    };
+
+    writer.write(msg).await.map_err(Error::Connection)
 }
 
 #[derive(Debug)]
@@ -100,6 +143,7 @@ pub enum Error {
     KeepAlive(connection::Error),
     PubKeyMismatch,
     ConnectionDoesNotExist,
+    PeerDoesNotExist,
 }
 
 impl From<handshake::Error> for Error {
@@ -113,12 +157,13 @@ pub async fn establish_connection<'a, T: SynDecider + Clone + Send + 'static>(
     keypair: &KeyPair,
     peer_pubkey: &Public,
     addr: SocketAddr,
+    ttl: Option<Duration>,
 ) -> Result<(), Error> {
     let mut backoff = Duration::from_secs(1);
     loop {
         {
             let conn_manager = util::get_lock(&conn_manager);
-            if conn_manager.table.connection_exists_for_peer(peer_pubkey) {
+            if conn_manager.pool.has_connection(&addr) {
                 return Ok(());
             }
             if conn_manager.pool.is_full() {
@@ -139,6 +184,7 @@ pub async fn establish_connection<'a, T: SynDecider + Clone + Send + 'static>(
                     keypair.public(),
                     server_pubkey,
                     key,
+                    ttl,
                 )
                 .await
                 .map(drop);
@@ -179,6 +225,12 @@ pub fn listen_for_peers<T: SynDecider + Clone + Send + 'static>(
                                     keypair.public(),
                                     client_pubkey,
                                     key,
+                                    // TODO(ross): For now any connections that peers establish
+                                    // with us will be long lived, but this is not likely to be the
+                                    // common case. In general, we will probably want to have some
+                                    // logic about what kind of connection to establish that may
+                                    // come from the user application.
+                                    None,
                                 )
                                 .await
                                 {
@@ -215,10 +267,16 @@ async fn add_to_pool_with_reuse<T: SynDecider + Clone + Send + 'static>(
     own_pubkey: &Public,
     peer_pubkey: Public,
     key: [u8; 32],
+    ttl: Option<Duration>,
 ) -> Result<Option<Connection>, Error> {
     let (own_decision, cipher) = {
         let conn_manager = util::get_lock(&conn_manager);
-        let own_decision = !conn_manager.table.has_peer(&peer_pubkey);
+        let own_decision = conn_manager
+            .table
+            .peer_socket_addr(&peer_pubkey)
+            .map(|addr| !conn_manager.pool.has_connection(addr))
+            .unwrap_or(true);
+        // let own_decision = !conn_manager.table.has_peer(&peer_pubkey);
         let cipher = aes_gcm::AesGcm::new(GenericArray::from_slice(&key));
         (own_decision, cipher)
     }; // Drop the lock.
@@ -232,7 +290,7 @@ async fn add_to_pool_with_reuse<T: SynDecider + Clone + Send + 'static>(
         conn_manager.table.add_unsigned_peer(peer_pubkey, addr);
         conn_manager
             .pool
-            .add_connection(stream, peer_pubkey, key)
+            .add_connection(stream, peer_pubkey, key, ttl)
             .map_err(Error::Pool)
     } else {
         Ok(None)
@@ -272,7 +330,9 @@ mod tests {
 
         let stream = std::net::TcpStream::connect(addr).unwrap();
         let stream = TcpStream::from_std(stream).unwrap();
-        let existing_conn = pool.add_connection(stream, *keypair.public(), key).unwrap();
+        let existing_conn = pool
+            .add_connection(stream, *keypair.public(), key, None)
+            .unwrap();
         assert!(existing_conn.is_none());
 
         let conn_manager = ConnectionManager::new(pool, table);
@@ -283,6 +343,7 @@ mod tests {
             &keypair,
             &peer_pubkey,
             addr,
+            None,
         ))
         .unwrap();
         let conn_manager = util::get_lock(&conn_manager);

@@ -565,6 +565,11 @@ impl<T> ConnectionPool<T> {
         self.connections.iter_mut()
     }
 
+    pub fn get_connection(&mut self, addr: &SocketAddr) -> Option<&Connection> {
+        self.clean_up_connection(addr);
+        self.connections.get(addr)
+    }
+
     pub fn get_connection_mut(&mut self, addr: &SocketAddr) -> Option<&mut Connection> {
         self.clean_up_connection(addr);
         self.connections.get_mut(addr)
@@ -595,6 +600,7 @@ impl<T: SynDecider + Clone + Send + 'static> ConnectionPool<T> {
         stream: TcpStream,
         pubkey: Public,
         key: [u8; 32],
+        ttl: Option<Duration>,
     ) -> Result<Option<Connection>, PoolError> {
         use PoolError::*;
 
@@ -605,7 +611,7 @@ impl<T: SynDecider + Clone + Send + 'static> ConnectionPool<T> {
         let mut conn = Connection::new(
             key,
             pubkey,
-            None, // FIXME(ross)
+            ttl,
             self.max_header_len,
             self.max_data_len,
             self.buffer_size,
