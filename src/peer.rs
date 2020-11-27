@@ -25,6 +25,8 @@ pub fn peer_discovery_task<T: SynDecider + Clone + Send + 'static>(
     peer_alpha: usize,
     ping_ttl: Duration,
     buffer_size: usize,
+    send_backoff: Duration,
+    send_backoff_multiplier: f64,
 ) -> (
     impl Future<Output = ()>,
     impl Future<Output = ()>,
@@ -39,6 +41,8 @@ pub fn peer_discovery_task<T: SynDecider + Clone + Send + 'static>(
         ping_interval,
         ping_alpha,
         ping_ttl,
+        send_backoff,
+        send_backoff_multiplier,
     );
     let ping_handler_fut = ping_handler(conn_manager, own_pubkey, receiver, peer_alpha);
 
@@ -52,6 +56,8 @@ async fn ping_sender<T: SynDecider + Clone + Send + 'static>(
     ping_interval: Duration,
     ping_alpha: usize,
     ping_ttl: Duration,
+    send_backoff: Duration,
+    send_backoff_multiplier: f64,
 ) {
     let mut ping_timer = time::interval(ping_interval);
     loop {
@@ -74,6 +80,8 @@ async fn ping_sender<T: SynDecider + Clone + Send + 'static>(
                 &peer,
                 ping.clone(),
                 Some(ping_ttl),
+                send_backoff,
+                send_backoff_multiplier,
             )
         }))
         .await;
@@ -213,10 +221,12 @@ mod tests {
         let max_header_len = 1024;
         let max_data_len = 1024;
         let buffer_size = 100;
-        let ping_interval = Duration::from_millis(1);
+        let ping_interval = Duration::from_millis(10);
         let ping_alpha = 3;
         let ping_ttl = Duration::from_secs(10);
         let peer_alpha = 3;
+        let send_backoff = Duration::from_millis(1);
+        let send_backoff_multiplier = 1.6;
 
         let keypair = Random.generate();
         let addr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
@@ -245,6 +255,8 @@ mod tests {
             peer_alpha,
             ping_ttl,
             buffer_size,
+            send_backoff,
+            send_backoff_multiplier,
         );
 
         let cm_to_pinger_fut = async move {
@@ -261,7 +273,7 @@ mod tests {
 
     #[tokio::test]
     async fn peer_discovery() {
-        let n = 5;
+        let n = 6;
 
         let mut keypairs = Vec::with_capacity(n);
         let mut ports = Vec::with_capacity(n);

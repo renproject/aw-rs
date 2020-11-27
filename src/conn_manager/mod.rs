@@ -10,6 +10,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::stream::StreamExt;
+use tokio::time;
 
 pub mod connection;
 pub mod peer_table;
@@ -95,6 +96,8 @@ pub async fn send_with_establish<T: SynDecider + Clone + Send + 'static>(
     peer: &Public,
     msg: Message,
     ttl: Option<Duration>,
+    initial_backoff: Duration,
+    backoff_multiplier: f64,
 ) -> Result<(), Error> {
     let (addr, maybe_writer) = {
         let mut conn_manager = conn_manager.lock().unwrap();
@@ -118,15 +121,32 @@ pub async fn send_with_establish<T: SynDecider + Clone + Send + 'static>(
             // set a timeout for this specific part is more useful.
             establish_connection(conn_manager, keypair, peer, addr, ttl).await?;
 
-            // TODO(ross): Since establishing a connection and getting it from the pool are two
-            // different operations, it is possible that between these two calls the connection
-            // will acually be removed from the pool, which will cause the following to panic. This
-            // should be addressed. Two possiblities:
-            // - Return the connection from the call to `establish_connection` along with a lock.
-            // - Retructure the weird ConnectionManager struct so that this problem doesn't
-            // manifest.
-            let mut conn_manager = conn_manager.lock().unwrap();
-            conn_manager.peer_connection(peer).expect("TODO")
+            // TODO(ross): Since we have just returned from establishing a connection, we expect
+            // that a connection for this peer should exist. This will be true in the vast majority
+            // of cases, but is not always necessarily true. Some ways in which this could happen
+            // are:
+            //      - No connection was existing but we receive a drop signal during the connection
+            //      duplication procedure. This could be due to a malicious peer or simultaneous
+            //      handshakes (the peer would send both a keep alive and a drop signal, but the
+            //      latter may arrive first).
+            //      - The connection existed but was dropped just after returning from above. This
+            //      could be caused by a task explicitly closing the connection, or the connection
+            //      either naturally expiring or being closed by the connection logic.
+            // To attempt to account for this possibility, we retry getting the connection for the
+            // peer from the peer table with a backoff. This resolves the former situation with a
+            // non-malicious peer, but does not resolve the others. How should we account for these
+            // other cases?
+            let mut backoff = initial_backoff;
+            loop {
+                {
+                    let mut conn_manager = conn_manager.lock().unwrap();
+                    if let Some(writer) = conn_manager.peer_connection(peer) {
+                        break writer;
+                    }
+                }
+                time::delay_for(backoff).await;
+                backoff = backoff.mul_f64(backoff_multiplier);
+            }
         }
         Some(writer) => writer,
     };
@@ -159,6 +179,7 @@ pub async fn establish_connection<'a, T: SynDecider + Clone + Send + 'static>(
     addr: SocketAddr,
     ttl: Option<Duration>,
 ) -> Result<(), Error> {
+    // TODO(ross): This should probably be configurable by the user.
     let mut backoff = Duration::from_secs(1);
     loop {
         {
@@ -178,7 +199,7 @@ pub async fn establish_connection<'a, T: SynDecider + Clone + Send + 'static>(
             Ok(mut stream) => {
                 let (key, server_pubkey) =
                     handshake::handshake(&mut stream, keypair, Some(peer_pubkey)).await?;
-                return add_to_pool_with_reuse(
+                let ret = add_to_pool_with_reuse(
                     conn_manager.clone(),
                     stream,
                     keypair.public(),
@@ -188,6 +209,10 @@ pub async fn establish_connection<'a, T: SynDecider + Clone + Send + 'static>(
                 )
                 .await
                 .map(drop);
+                if ret.is_ok() {
+                } else {
+                }
+                return ret;
             }
             Err(_e) => {
                 tokio::time::delay_for(backoff).await;

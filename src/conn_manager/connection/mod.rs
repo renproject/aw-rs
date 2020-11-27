@@ -620,7 +620,8 @@ impl<T: SynDecider + Clone + Send + 'static> ConnectionPool<T> {
         );
         let not_drained = conn.drain_into(self.reads_ref.clone());
         assert!(not_drained);
-        Ok(self.connections.insert(peer_addr, conn))
+        let ret = Ok(self.connections.insert(peer_addr, conn));
+        ret
     }
 }
 
