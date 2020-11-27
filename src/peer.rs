@@ -28,8 +28,6 @@ pub struct PingerOptions {
     pub send_backoff_multiplier: f64,
 }
 
-pub enum Error {}
-
 pub fn peer_discovery_task<T: SynDecider + Clone + Send + 'static>(
     conn_manager: Arc<Mutex<ConnectionManager<T>>>,
     keypair: KeyPair,

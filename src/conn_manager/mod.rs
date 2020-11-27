@@ -135,7 +135,8 @@ pub async fn send_with_establish<T: SynDecider + Clone + Send + 'static>(
             // To attempt to account for this possibility, we retry getting the connection for the
             // peer from the peer table with a backoff. This resolves the former situation with a
             // non-malicious peer, but does not resolve the others. How should we account for these
-            // other cases?
+            // other cases? For now the user of the function should call this method with a timeou
+            // if they are worried about these other cases ocurring.
             let mut backoff = initial_backoff;
             loop {
                 {
