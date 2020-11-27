@@ -5,7 +5,7 @@ use aw::conn_manager::{
     ConnectionManager,
 };
 use aw::gossip::Decider;
-use aw::peer;
+use aw::peer::{self, Options, PingerOptions};
 use futures::Future;
 use futures::FutureExt;
 use parity_crypto::publickey::{Generator, KeyPair, Random};
@@ -23,13 +23,19 @@ fn create_peer() -> (
     let max_connections = 100;
     let max_header_len = 1024;
     let max_data_len = 1024;
-    let buffer_size = 100;
-    let ping_interval = Duration::from_millis(10);
-    let ping_alpha = 3;
-    let ping_ttl = Duration::from_secs(10);
-    let peer_alpha = 3;
-    let send_backoff = Duration::from_millis(1);
-    let send_backoff_multiplier = 1.6;
+
+    let pinger_options = PingerOptions {
+        ping_interval: Duration::from_millis(10),
+        ping_alpha: 3,
+        ping_ttl: Duration::from_secs(10),
+        send_backoff: Duration::from_millis(1),
+        send_backoff_multiplier: 1.6,
+    };
+    let options = Options {
+        pinger_options,
+        peer_alpha: 3,
+        buffer_size: 100,
+    };
 
     let keypair = Random.generate();
     let addr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
@@ -39,7 +45,7 @@ fn create_peer() -> (
         max_connections,
         max_header_len,
         max_data_len,
-        buffer_size,
+        options.buffer_size,
         decider,
     );
     let table = PeerTable::new();
@@ -52,13 +58,7 @@ fn create_peer() -> (
         conn_manager.clone(),
         keypair.clone(),
         Some(signed_addr),
-        ping_interval,
-        ping_alpha,
-        peer_alpha,
-        ping_ttl,
-        buffer_size,
-        send_backoff,
-        send_backoff_multiplier,
+        options,
     );
 
     let cm_to_pinger_fut = async move {

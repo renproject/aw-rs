@@ -14,36 +14,41 @@ use tokio::time;
 // public key of a peer. For example, when handling a ping response we should check to see if the
 // recovered public key matches the filter predicate and act accordingly.
 
+pub struct Options {
+    pub pinger_options: PingerOptions,
+    pub peer_alpha: usize,
+    pub buffer_size: usize,
+}
+
+pub struct PingerOptions {
+    pub ping_interval: Duration,
+    pub ping_alpha: usize,
+    pub ping_ttl: Duration,
+    pub send_backoff: Duration,
+    pub send_backoff_multiplier: f64,
+}
+
 pub enum Error {}
 
 pub fn peer_discovery_task<T: SynDecider + Clone + Send + 'static>(
     conn_manager: Arc<Mutex<ConnectionManager<T>>>,
     keypair: KeyPair,
     own_addr: Option<SignedAddress>,
-    ping_interval: Duration,
-    ping_alpha: usize,
-    peer_alpha: usize,
-    ping_ttl: Duration,
-    buffer_size: usize,
-    send_backoff: Duration,
-    send_backoff_multiplier: f64,
+    options: Options,
 ) -> (
     impl Future<Output = ()>,
     impl Future<Output = ()>,
     mpsc::Sender<(Public, Message)>,
 ) {
+    let Options {
+        pinger_options,
+        peer_alpha,
+        buffer_size,
+    } = options;
+
     let own_pubkey = *keypair.public();
     let (sender, receiver) = mpsc::channel(buffer_size);
-    let ping_sender_fut = ping_sender(
-        conn_manager.clone(),
-        keypair,
-        own_addr,
-        ping_interval,
-        ping_alpha,
-        ping_ttl,
-        send_backoff,
-        send_backoff_multiplier,
-    );
+    let ping_sender_fut = ping_sender(conn_manager.clone(), keypair, own_addr, pinger_options);
     let ping_handler_fut = ping_handler(conn_manager, own_pubkey, receiver, peer_alpha);
 
     (ping_sender_fut, ping_handler_fut, sender)
@@ -53,12 +58,16 @@ async fn ping_sender<T: SynDecider + Clone + Send + 'static>(
     conn_manager: Arc<Mutex<ConnectionManager<T>>>,
     keypair: KeyPair,
     own_addr: Option<SignedAddress>,
-    ping_interval: Duration,
-    ping_alpha: usize,
-    ping_ttl: Duration,
-    send_backoff: Duration,
-    send_backoff_multiplier: f64,
+    options: PingerOptions,
 ) {
+    let PingerOptions {
+        ping_interval,
+        ping_alpha,
+        ping_ttl,
+        send_backoff,
+        send_backoff_multiplier,
+    } = options;
+
     let mut ping_timer = time::interval(ping_interval);
     loop {
         ping_timer.tick().await;
@@ -220,13 +229,19 @@ mod tests {
         let max_connections = 100;
         let max_header_len = 1024;
         let max_data_len = 1024;
-        let buffer_size = 100;
-        let ping_interval = Duration::from_millis(10);
-        let ping_alpha = 3;
-        let ping_ttl = Duration::from_secs(10);
-        let peer_alpha = 3;
-        let send_backoff = Duration::from_millis(1);
-        let send_backoff_multiplier = 1.6;
+
+        let pinger_options = PingerOptions {
+            ping_interval: Duration::from_millis(10),
+            ping_alpha: 3,
+            ping_ttl: Duration::from_secs(10),
+            send_backoff: Duration::from_millis(1),
+            send_backoff_multiplier: 1.6,
+        };
+        let options = Options {
+            pinger_options,
+            peer_alpha: 3,
+            buffer_size: 100,
+        };
 
         let keypair = Random.generate();
         let addr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
@@ -236,7 +251,7 @@ mod tests {
             max_connections,
             max_header_len,
             max_data_len,
-            buffer_size,
+            options.buffer_size,
             decider,
         );
         let table = PeerTable::new();
@@ -250,13 +265,7 @@ mod tests {
             conn_manager.clone(),
             keypair.clone(),
             Some(signed_addr),
-            ping_interval,
-            ping_alpha,
-            peer_alpha,
-            ping_ttl,
-            buffer_size,
-            send_backoff,
-            send_backoff_multiplier,
+            options,
         );
 
         let cm_to_pinger_fut = async move {
