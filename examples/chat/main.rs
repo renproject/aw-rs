@@ -1,4 +1,5 @@
 use aw::message::{Header, To, GOSSIP_PEER_ID};
+use aw::peer;
 use aw::{conn_manager, util, ConnectionManager};
 use parity_crypto::publickey;
 use parity_crypto::publickey::{Generator, KeyPair, Public, Random};
@@ -8,6 +9,7 @@ use std::io::Read;
 use std::net::SocketAddr;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tokio::sync::mpsc;
 
 mod alias;
@@ -35,11 +37,27 @@ async fn main() {
     let max_data_len = 2048;
     let buffer_size = 100;
     let alpha = 3;
+    let own_addr = None; // TODO(ross)
+    let pinger_options = peer::PingerOptions {
+        ping_interval: Duration::from_secs(1),
+        ping_alpha: 3,
+        ping_ttl: Duration::from_secs(10),
+        send_backoff: Duration::from_secs(1),
+        send_backoff_multiplier: 1.6,
+    };
+    let peer_options = peer::Options {
+        pinger_options,
+        peer_alpha: 3,
+        buffer_size: 100,
+    };
+
     let will_pull = move |header: &Header| {
         header.to == aw::id_from_pubkey(&own_pubkey) || header.to == GOSSIP_PEER_ID
     };
     let (aw_fut, conn_manager, _port, aw_in, mut aw_out) = aw::new_aw_task(
         keypair.clone(),
+        own_addr,
+        peer_options,
         port,
         will_pull,
         max_connections,

@@ -1,8 +1,9 @@
 use aw::conn_manager::{self, peer_table};
 use aw::message::{Header, To, GOSSIP_PEER_ID};
+use aw::peer;
 use parity_crypto::publickey::{Generator, Random};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 #[tokio::main(core_threads = 1)]
 async fn main() {
@@ -14,6 +15,18 @@ async fn main() {
     let max_data_len = 1024;
     let buffer_size = 100;
     let alpha = 3;
+    let pinger_options = peer::PingerOptions {
+        ping_interval: Duration::from_secs(1),
+        ping_alpha: 3,
+        ping_ttl: Duration::from_secs(10),
+        send_backoff: Duration::from_secs(1),
+        send_backoff_multiplier: 1.6,
+    };
+    let peer_options = peer::Options {
+        pinger_options,
+        peer_alpha: 3,
+        buffer_size: 100,
+    };
 
     let keypairs: Vec<_> = (0..n).map(|_| Random.generate()).collect();
 
@@ -29,6 +42,8 @@ async fn main() {
         };
         let (future, connection_manager, port, sender, receiver) = aw::new_aw_task(
             keypair.clone(),
+            None,
+            peer_options.clone(),
             0,
             will_pull,
             max_connections,

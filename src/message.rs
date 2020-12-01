@@ -24,6 +24,12 @@ pub enum Variant {
     Pong,
 }
 
+impl Variant {
+    pub fn is_peer_message(&self) -> bool {
+        self == &Variant::Ping || self == &Variant::Pong
+    }
+}
+
 impl From<Variant> for u16 {
     fn from(var: Variant) -> Self {
         use Variant::*;

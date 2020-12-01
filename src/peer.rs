@@ -14,12 +14,14 @@ use tokio::time;
 // public key of a peer. For example, when handling a ping response we should check to see if the
 // recovered public key matches the filter predicate and act accordingly.
 
+#[derive(Debug, Clone)]
 pub struct Options {
     pub pinger_options: PingerOptions,
     pub peer_alpha: usize,
     pub buffer_size: usize,
 }
 
+#[derive(Debug, Clone)]
 pub struct PingerOptions {
     pub ping_interval: Duration,
     pub ping_alpha: usize,

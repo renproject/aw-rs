@@ -75,7 +75,7 @@ fn create_peer() -> (
 
 #[tokio::main(core_threads = 1)]
 async fn main() {
-    let n = 5;
+    let n = 10;
 
     let mut keypairs = Vec::with_capacity(n);
     let mut ports = Vec::with_capacity(n);
@@ -108,7 +108,7 @@ async fn main() {
 
     let now = Instant::now();
 
-    let mut timer = time::interval(Duration::from_millis(2));
+    let mut timer = time::interval(Duration::from_millis(10));
     let mut count = 0;
     let check_fut = async move {
         'outer: loop {

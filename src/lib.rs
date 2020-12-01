@@ -12,9 +12,12 @@ pub mod message;
 pub mod peer;
 pub mod util;
 
-use conn_manager::{connection::ConnectionPool, peer_table::PeerTable};
+use conn_manager::{
+    connection::ConnectionPool,
+    peer_table::{PeerTable, SignedAddress},
+};
 use gossip::Decider;
-use message::{Header, To};
+use message::{Header, Message, To};
 
 pub use conn_manager::peer_table::id_from_pubkey;
 
@@ -29,6 +32,8 @@ pub enum Error {
 
 pub fn new_aw_task<F>(
     own_keypair: KeyPair,
+    own_addr: Option<SignedAddress>,
+    peer_options: peer::Options,
     port: u16,
     will_pull: F,
     max_connections: usize,
@@ -60,7 +65,7 @@ where
     );
     let table = PeerTable::new();
     let conn_manager = Arc::new(Mutex::new(ConnectionManager::new(pool, table)));
-    let (gossip_fut, mut cm_in, gossip_in, gossip_out) = gossip::gossip_task(
+    let (gossip_fut, mut gossip_network_in, gossip_in, gossip_out) = gossip::gossip_task(
         buffer_size,
         alpha,
         own_pubkey,
@@ -68,11 +73,28 @@ where
         &decider,
         conn_manager.clone(),
     );
+    let (ping_sender_fut, ping_handler_fut, mut peer_network_in) = peer::peer_discovery_task(
+        conn_manager.clone(),
+        own_keypair.clone(),
+        own_addr,
+        peer_options,
+    );
+    let ping_sender_fut = ping_sender_fut.map(Result::<(), Error>::Ok);
+    let ping_handler_fut = ping_handler_fut.map(Result::<(), Error>::Ok);
     let gossip_fut = gossip_fut.map(|res| res.map_err(Error::Gossip));
-    let cm_to_gossiper_fut = async move {
+    let route_incoming_fut = async move {
         while let Some(msg) = reads.recv().await {
-            if cm_in.send(msg).await.is_err() {
-                break;
+            match &msg {
+                (_, Message::Header(header)) if header.variant.is_peer_message() => {
+                    if peer_network_in.send(msg).await.is_err() {
+                        break;
+                    }
+                }
+                _ => {
+                    if gossip_network_in.send(msg).await.is_err() {
+                        break;
+                    }
+                }
             }
         }
         Result::<(), _>::Err(Error::Internal)
@@ -85,8 +107,14 @@ where
         port,
     )?;
     let listen_fut = listen_fut.map(Result::<(), Error>::Ok);
-    let task = futures::future::try_join3(gossip_fut, cm_to_gossiper_fut, listen_fut)
-        .map(|res| res.map(drop));
+    let task = futures::future::try_join5(
+        gossip_fut,
+        ping_sender_fut,
+        ping_handler_fut,
+        route_incoming_fut,
+        listen_fut,
+    )
+    .map(|res| res.map(drop));
 
     Ok((task, conn_manager, port, gossip_in, gossip_out))
 }
@@ -99,6 +127,7 @@ mod tests {
     use crate::message::GOSSIP_PEER_ID;
     use parity_crypto::publickey::{Generator, Random};
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use std::time::Duration;
 
     #[tokio::test]
     async fn gossip_in_partially_connected_network() {
@@ -110,6 +139,19 @@ mod tests {
         let max_data_len = 1024;
         let buffer_size = 100;
         let alpha = 3;
+        let own_addr = None;
+        let pinger_options = peer::PingerOptions {
+            ping_interval: Duration::from_secs(1),
+            ping_alpha: 3,
+            ping_ttl: Duration::from_secs(10),
+            send_backoff: Duration::from_secs(1),
+            send_backoff_multiplier: 1.6,
+        };
+        let peer_options = peer::Options {
+            pinger_options,
+            peer_alpha: 3,
+            buffer_size: 100,
+        };
 
         let keypairs: Vec<_> = (0..n).map(|_| Random.generate()).collect();
 
@@ -125,6 +167,8 @@ mod tests {
             };
             let (future, connection_manager, port, sender, receiver) = new_aw_task(
                 keypair.clone(),
+                own_addr.clone(),
+                peer_options.clone(),
                 0,
                 will_pull,
                 max_connections,
