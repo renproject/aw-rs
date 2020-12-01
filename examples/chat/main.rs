@@ -1,3 +1,4 @@
+use aw::gossip;
 use aw::message::{Header, To, GOSSIP_PEER_ID};
 use aw::peer;
 use aw::{conn_manager, util, ConnectionManager};
@@ -38,10 +39,18 @@ async fn main() {
     let buffer_size = 100;
     let alpha = 3;
     let own_addr = None; // TODO(ross)
+    let gossip_options = gossip::Options {
+        buffer_size,
+        alpha,
+        send_timeout: Duration::from_secs(30),
+        ttl: Some(Duration::from_secs(30)),
+        initial_backoff: Duration::from_secs(1),
+        backoff_multiplier: 1.6,
+    };
     let pinger_options = peer::PingerOptions {
         ping_interval: Duration::from_secs(1),
         ping_alpha: 3,
-        ping_ttl: Duration::from_secs(10),
+        ping_ttl: Duration::from_secs(30),
         send_backoff: Duration::from_secs(1),
         send_backoff_multiplier: 1.6,
     };
@@ -57,14 +66,14 @@ async fn main() {
     let (aw_fut, conn_manager, _port, aw_in, mut aw_out) = aw::new_aw_task(
         keypair.clone(),
         own_addr,
+        will_pull,
+        gossip_options,
         peer_options,
         port,
-        will_pull,
         max_connections,
         max_header_len,
         max_data_len,
         buffer_size,
-        alpha,
     )
     .expect("creating aw task");
     let aw_handle = tokio::spawn(aw_fut);

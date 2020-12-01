@@ -1,4 +1,5 @@
 use aw::conn_manager::{self, peer_table};
+use aw::gossip;
 use aw::message::{Header, To, GOSSIP_PEER_ID};
 use aw::peer;
 use parity_crypto::publickey::{Generator, Random};
@@ -15,6 +16,14 @@ async fn main() {
     let max_data_len = 1024;
     let buffer_size = 100;
     let alpha = 3;
+    let gossip_options = gossip::Options {
+        buffer_size,
+        alpha,
+        send_timeout: Duration::from_secs(1),
+        ttl: Some(Duration::from_secs(10)),
+        initial_backoff: Duration::from_secs(1),
+        backoff_multiplier: 1.6,
+    };
     let pinger_options = peer::PingerOptions {
         ping_interval: Duration::from_secs(1),
         ping_alpha: 3,
@@ -43,14 +52,14 @@ async fn main() {
         let (future, connection_manager, port, sender, receiver) = aw::new_aw_task(
             keypair.clone(),
             None,
+            will_pull,
+            gossip_options.clone(),
             peer_options.clone(),
             0,
-            will_pull,
             max_connections,
             max_header_len,
             max_data_len,
             buffer_size,
-            alpha,
         )
         .expect("creaing aw task");
 

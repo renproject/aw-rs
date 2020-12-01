@@ -33,14 +33,14 @@ pub enum Error {
 pub fn new_aw_task<F>(
     own_keypair: KeyPair,
     own_addr: Option<SignedAddress>,
+    will_pull: F,
+    gossip_options: gossip::Options,
     peer_options: peer::Options,
     port: u16,
-    will_pull: F,
     max_connections: usize,
     max_header_len: usize,
     max_data_len: usize,
     buffer_size: usize,
-    alpha: usize,
 ) -> Result<
     (
         impl Future<Output = Result<(), Error>>,
@@ -54,7 +54,6 @@ pub fn new_aw_task<F>(
 where
     F: Fn(&Header) -> bool + Send + Sync + 'static,
 {
-    let own_pubkey = *own_keypair.public();
     let decider = Decider::new();
     let (pool, mut reads) = ConnectionPool::new_with_max_connections_allocated(
         max_connections,
@@ -66,12 +65,11 @@ where
     let table = PeerTable::new();
     let conn_manager = Arc::new(Mutex::new(ConnectionManager::new(pool, table)));
     let (gossip_fut, mut gossip_network_in, gossip_in, gossip_out) = gossip::gossip_task(
-        buffer_size,
-        alpha,
-        own_pubkey,
-        will_pull,
-        &decider,
+        own_keypair.clone(),
         conn_manager.clone(),
+        &decider,
+        will_pull,
+        gossip_options,
     );
     let (ping_sender_fut, ping_handler_fut, mut peer_network_in) = peer::peer_discovery_task(
         conn_manager.clone(),
@@ -140,6 +138,14 @@ mod tests {
         let buffer_size = 100;
         let alpha = 3;
         let own_addr = None;
+        let gossip_options = gossip::Options {
+            buffer_size,
+            alpha,
+            send_timeout: Duration::from_secs(1),
+            ttl: Some(Duration::from_secs(10)),
+            initial_backoff: Duration::from_secs(1),
+            backoff_multiplier: 1.6,
+        };
         let pinger_options = peer::PingerOptions {
             ping_interval: Duration::from_secs(1),
             ping_alpha: 3,
@@ -168,14 +174,14 @@ mod tests {
             let (future, connection_manager, port, sender, receiver) = new_aw_task(
                 keypair.clone(),
                 own_addr.clone(),
+                will_pull,
+                gossip_options.clone(),
                 peer_options.clone(),
                 0,
-                will_pull,
                 max_connections,
                 max_header_len,
                 max_data_len,
                 buffer_size,
-                alpha,
             )
             .expect("creaing aw task");
 

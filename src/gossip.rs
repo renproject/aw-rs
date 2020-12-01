@@ -3,19 +3,30 @@ use crate::conn_manager::{self, connection::SynDecider, ConnectionManager};
 use crate::message::{self, Header, Message, To, Variant, V1};
 use crate::util;
 use futures::future::Future;
-use parity_crypto::publickey::Public;
+use parity_crypto::publickey::{KeyPair, Public};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tokio::stream::StreamExt;
 use tokio::sync::mpsc;
+use tokio::time;
+
+#[derive(Debug, Clone)]
+pub struct Options {
+    pub buffer_size: usize,
+    pub alpha: usize,
+    pub send_timeout: Duration,
+    pub ttl: Option<Duration>,
+    pub initial_backoff: Duration,
+    pub backoff_multiplier: f64,
+}
 
 pub fn gossip_task<F>(
-    buffer_size: usize,
-    alpha: usize,
-    own_pubkey: Public,
-    will_pull: F,
-    decider: &Decider,
+    keypair: KeyPair,
     conn_manager: Arc<Mutex<ConnectionManager<Decider>>>,
+    decider: &Decider,
+    will_pull: F,
+    options: Options,
 ) -> (
     impl Future<Output = Result<(), mpsc::error::TrySendError<(Public, Vec<u8>)>>>,
     mpsc::Sender<(Public, Message)>,
@@ -25,51 +36,73 @@ pub fn gossip_task<F>(
 where
     F: Fn(&Header) -> bool,
 {
-    let (network_sender, network_receiver) = mpsc::channel(buffer_size);
-    let (user_out_sender, user_out_receiver) = mpsc::channel(buffer_size);
-    let (user_in_sender, user_in_receiver) = mpsc::channel(buffer_size);
+    let (network_sender, network_receiver) = mpsc::channel(options.buffer_size);
+    let (user_out_sender, user_out_receiver) = mpsc::channel(options.buffer_size);
+    let (user_in_sender, user_in_receiver) = mpsc::channel(options.buffer_size);
     let received = Arc::new(Mutex::new(HashMap::new()));
     let requested = decider.requested.clone();
     let fut = consumer_fut(
-        alpha,
-        own_pubkey,
-        network_receiver,
-        user_in_receiver,
-        user_out_sender,
+        keypair,
+        conn_manager,
         will_pull,
         received,
         requested,
-        conn_manager,
+        network_receiver,
+        user_in_receiver,
+        user_out_sender,
+        options,
     );
 
     (fut, network_sender, user_in_sender, user_out_receiver)
 }
 
 async fn consumer_fut<F>(
-    alpha: usize,
-    own_pubkey: Public,
-    network_receiver: mpsc::Receiver<(Public, Message)>,
-    user_receiver: mpsc::Receiver<(To, Vec<u8>, Vec<u8>)>,
-    user_sender: mpsc::Sender<(Public, Vec<u8>)>,
+    keypair: KeyPair,
+    conn_manager: Arc<Mutex<ConnectionManager<Decider>>>,
     will_pull: F,
     received: Arc<Mutex<HashMap<Vec<u8>, Option<Vec<u8>>>>>,
     requested: Arc<Mutex<HashMap<Vec<u8>, ()>>>,
-    conn_manager: Arc<Mutex<ConnectionManager<Decider>>>,
+    network_receiver: mpsc::Receiver<(Public, Message)>,
+    user_receiver: mpsc::Receiver<(To, Vec<u8>, Vec<u8>)>,
+    user_sender: mpsc::Sender<(Public, Vec<u8>)>,
+    options: Options,
 ) -> Result<(), mpsc::error::TrySendError<(Public, Vec<u8>)>>
 where
     F: Fn(&Header) -> bool,
 {
+    let Options {
+        alpha,
+        send_timeout,
+        ttl,
+        initial_backoff,
+        backoff_multiplier,
+        ..
+    } = options;
     let network_fut = network_fut(
         alpha,
-        own_pubkey,
+        keypair.clone(),
         network_receiver,
         user_sender,
         will_pull,
         received.clone(),
         requested,
         conn_manager.clone(),
+        send_timeout,
+        ttl,
+        initial_backoff,
+        backoff_multiplier,
     );
-    let user_fut = user_fut(alpha, user_receiver, received, conn_manager);
+    let user_fut = user_fut(
+        alpha,
+        user_receiver,
+        received,
+        conn_manager,
+        keypair,
+        send_timeout,
+        ttl,
+        initial_backoff,
+        backoff_multiplier,
+    );
 
     futures::future::join(network_fut, user_fut).await.0
 }
@@ -79,6 +112,11 @@ async fn user_fut(
     mut user_receiver: mpsc::Receiver<(To, Vec<u8>, Vec<u8>)>,
     received: Arc<Mutex<HashMap<Vec<u8>, Option<Vec<u8>>>>>,
     conn_manager: Arc<Mutex<ConnectionManager<Decider>>>,
+    keypair: KeyPair,
+    send_timeout: Duration,
+    ttl: Option<Duration>,
+    initial_backoff: Duration,
+    backoff_multiplier: f64,
 ) {
     while let Some((to, key, message)) = user_receiver.recv().await {
         {
@@ -90,9 +128,23 @@ async fn user_fut(
                 let header =
                     Header::new(V1, Variant::Push, peer_table::id_from_pubkey(&pubkey), key);
                 let message = Message::Header(header);
-                conn_manager::try_send_peer(&conn_manager, &pubkey, message)
-                    .await
-                    .expect("TODO");
+                if let Err(_e) = time::timeout(
+                    send_timeout,
+                    conn_manager::send_with_establish(
+                        &conn_manager,
+                        &keypair,
+                        &pubkey,
+                        message,
+                        ttl,
+                        initial_backoff,
+                        backoff_multiplier,
+                    ),
+                )
+                .await
+                {
+                    // TODO(ross): We need to figure out what the error logging story is. Print?
+                    // Write to file? Send back to user on a channel? etc.
+                }
             }
             To::Subnet(_) => todo!(),
             To::Gossip => {
@@ -102,11 +154,29 @@ async fn user_fut(
                 };
                 let header = Header::new(V1, Variant::Push, message::GOSSIP_PEER_ID, key);
                 let message = Message::Header(header);
-                futures::future::join_all(
-                    peers.iter().map(|peer| {
-                        conn_manager::try_send_peer(&conn_manager, peer, message.clone())
-                    }),
-                )
+                // TODO(ross): There should probably be a configurable option for a percentage of
+                // peers that the message is successfully sent to for this future to be considered
+                // to have executed successfully.
+                // TODO(ross): This should not really await the completion of the future, as this
+                // can clog up the processing of subsequent messages from the channel. On the other
+                // hand, we should be careful to not just always spawn these futures, because they
+                // can be long lasting and we would therefore allow the possibility of consuming an
+                // unbounded number of resources. We need to thing about how to make the resource
+                // usage bounded (e.g. by having a set number of worker tasks).
+                futures::future::join_all(peers.iter().map(|peer| {
+                    time::timeout(
+                        send_timeout,
+                        conn_manager::send_with_establish(
+                            &conn_manager,
+                            &keypair,
+                            peer,
+                            message.clone(),
+                            ttl,
+                            initial_backoff,
+                            backoff_multiplier,
+                        ),
+                    )
+                }))
                 .await;
             }
         }
@@ -115,13 +185,17 @@ async fn user_fut(
 
 async fn network_fut<F>(
     alpha: usize,
-    own_pubkey: Public,
+    keypair: KeyPair,
     mut network_receiver: mpsc::Receiver<(Public, Message)>,
     mut user_sender: mpsc::Sender<(Public, Vec<u8>)>,
     will_pull: F,
     received: Arc<Mutex<HashMap<Vec<u8>, Option<Vec<u8>>>>>,
     requested: Arc<Mutex<HashMap<Vec<u8>, ()>>>,
     conn_manager: Arc<Mutex<ConnectionManager<Decider>>>,
+    send_timeout: Duration,
+    ttl: Option<Duration>,
+    initial_backoff: Duration,
+    backoff_multiplier: f64,
 ) -> Result<(), mpsc::error::TrySendError<(Public, Vec<u8>)>>
 where
     F: Fn(&Header) -> bool,
@@ -130,7 +204,7 @@ where
         match &message {
             Message::Header(_header) => (),
             Message::Syn(header, _) => {
-                if header.to != peer_table::id_from_pubkey(&own_pubkey) {
+                if header.to != peer_table::id_from_pubkey(keypair.public()) {
                     let peers = {
                         let conn_manager = util::get_lock(&conn_manager);
                         conn_manager.random_peer_subset(alpha)
@@ -147,7 +221,18 @@ where
                     // receive the message given that we don't even check that we have a connection
                     // for the given peer.
                     futures::future::join_all(peers.iter().map(|peer| {
-                        conn_manager::try_send_peer(&conn_manager, peer, message.clone())
+                        time::timeout(
+                            send_timeout,
+                            conn_manager::send_with_establish(
+                                &conn_manager,
+                                &keypair,
+                                peer,
+                                message.clone(),
+                                ttl,
+                                initial_backoff,
+                                backoff_multiplier,
+                            ),
+                        )
                     }))
                     .await;
                 }
@@ -157,12 +242,23 @@ where
         match handle_incoming(message, &will_pull, &received, &requested) {
             Some(Response::User(msg)) => user_sender.try_send((pubkey, msg))?,
             Some(Response::Network(msg)) => {
-                conn_manager::try_send_peer(&conn_manager, &pubkey, msg)
-                    .await
-                    .err()
-                    .map(|_e| {
-                        // TODO(ross): Should we do seomthing about this error?
-                    });
+                time::timeout(
+                    send_timeout,
+                    conn_manager::send_with_establish(
+                        &conn_manager,
+                        &keypair,
+                        &pubkey,
+                        msg,
+                        ttl,
+                        initial_backoff,
+                        backoff_multiplier,
+                    ),
+                )
+                .await
+                .err()
+                .map(|_e| {
+                    // TODO(ross): Should we do seomthing about this error?
+                });
             }
             _ => (),
         }
