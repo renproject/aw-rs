@@ -5,11 +5,14 @@ use std::net::{IpAddr, Ipv4Addr};
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 
+// TOOD(ross): It is likely that not all of these will be made public, but others should be public
+// only to this crate.
 pub mod conn_manager;
 pub mod gossip;
 pub mod handshake;
 pub mod message;
 pub mod peer;
+pub mod rate;
 pub mod util;
 
 use conn_manager::{
@@ -36,6 +39,7 @@ pub fn new_aw_task<F>(
     will_pull: F,
     gossip_options: gossip::Options,
     peer_options: peer::Options,
+    listener_rate_limiter_options: rate::Options,
     port: u16,
     max_connections: usize,
     max_header_len: usize,
@@ -103,6 +107,7 @@ where
         own_keypair.clone(),
         IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)),
         port,
+        listener_rate_limiter_options,
     )?;
     let listen_fut = listen_fut.map(Result::<(), Error>::Ok);
     let task = futures::future::try_join5(
@@ -158,6 +163,11 @@ mod tests {
             peer_alpha: 3,
             buffer_size: 100,
         };
+        let listener_rate_limiter_options = rate::Options {
+            capacity: 1000,
+            limit: 10,
+            period: Duration::from_secs(60),
+        };
 
         let keypairs: Vec<_> = (0..n).map(|_| Random.generate()).collect();
 
@@ -177,6 +187,7 @@ mod tests {
                 will_pull,
                 gossip_options.clone(),
                 peer_options.clone(),
+                listener_rate_limiter_options.clone(),
                 0,
                 max_connections,
                 max_header_len,

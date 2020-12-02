@@ -1,6 +1,7 @@
 use aw::gossip;
 use aw::message::{Header, To, GOSSIP_PEER_ID};
 use aw::peer;
+use aw::rate;
 use aw::{conn_manager, util, ConnectionManager};
 use parity_crypto::publickey;
 use parity_crypto::publickey::{Generator, KeyPair, Public, Random};
@@ -59,6 +60,11 @@ async fn main() {
         peer_alpha: 3,
         buffer_size: 100,
     };
+    let listener_rate_limiter_options = rate::Options {
+        capacity: 1000,
+        limit: 10,
+        period: Duration::from_secs(60),
+    };
 
     let will_pull = move |header: &Header| {
         header.to == aw::id_from_pubkey(&own_pubkey) || header.to == GOSSIP_PEER_ID
@@ -69,6 +75,7 @@ async fn main() {
         will_pull,
         gossip_options,
         peer_options,
+        listener_rate_limiter_options,
         port,
         max_connections,
         max_header_len,

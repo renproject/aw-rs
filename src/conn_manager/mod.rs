@@ -1,6 +1,7 @@
 use crate::conn_manager::connection::{Connection, ConnectionWriter};
 use crate::handshake;
 use crate::message::Message;
+use crate::rate::{self, BoundedUniformLimiterMap};
 use crate::util::{self, SharedPtr};
 use aes_gcm::aead::{generic_array::GenericArray, NewAead};
 use futures::Future;
@@ -228,6 +229,7 @@ pub fn listen_for_peers<T: SynDecider + Clone + Send + 'static>(
     keypair: KeyPair,
     addr: IpAddr,
     port: u16,
+    rate_limiter_options: rate::Options,
 ) -> Result<(u16, impl Future<Output = ()>), io::Error> {
     // NOTE(ross): Here we block on binding the listener, because when binding to a socket address
     // (or more specifically an address that doesn't require a DNS lookup) the call should complete
@@ -235,11 +237,22 @@ pub fn listen_for_peers<T: SynDecider + Clone + Send + 'static>(
     // was 0 (in which case the actual port will be randomly assigned).
     let mut listener = futures::executor::block_on(TcpListener::bind(SocketAddr::new(addr, port)))?;
     let port = listener.local_addr()?.port();
+    let mut rate_limter = BoundedUniformLimiterMap::new(rate_limiter_options);
 
     let fut = async move {
         while let Some(stream) = listener.incoming().next().await {
             match stream {
                 Ok(mut stream) => {
+                    // Rate limiting based on IP address.
+                    let ip_addr = match stream.local_addr() {
+                        Ok(addr) => addr,
+                        Err(_e) => todo!("what does this error mean?"),
+                    }
+                    .ip();
+                    if !rate_limter.allow(ip_addr) {
+                        continue;
+                    }
+
                     let keypair = keypair.clone();
                     let conn_manager = conn_manager.clone();
                     tokio::spawn(async move {

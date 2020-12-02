@@ -6,6 +6,7 @@ use aw::conn_manager::{
 };
 use aw::gossip::Decider;
 use aw::peer::{self, Options, PingerOptions};
+use aw::rate;
 use futures::Future;
 use futures::FutureExt;
 use parity_crypto::publickey::{Generator, KeyPair, Random};
@@ -36,6 +37,11 @@ fn create_peer() -> (
         peer_alpha: 3,
         buffer_size: 100,
     };
+    let listener_rate_limiter_options = rate::Options {
+        capacity: 1000,
+        limit: 10,
+        period: Duration::from_secs(60),
+    };
 
     let keypair = Random.generate();
     let addr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
@@ -50,8 +56,14 @@ fn create_peer() -> (
     );
     let table = PeerTable::new();
     let conn_manager = Arc::new(Mutex::new(ConnectionManager::new(pool, table)));
-    let (port, listen_fut) =
-        conn_manager::listen_for_peers(conn_manager.clone(), keypair.clone(), addr, 0).unwrap();
+    let (port, listen_fut) = conn_manager::listen_for_peers(
+        conn_manager.clone(),
+        keypair.clone(),
+        addr,
+        0,
+        listener_rate_limiter_options,
+    )
+    .unwrap();
     let signed_addr = SignedAddress::new(SocketAddr::new(addr, port), keypair.secret()).unwrap();
 
     let (pinger_task, handler_task, mut ping_pong_sender) = peer::peer_discovery_task(

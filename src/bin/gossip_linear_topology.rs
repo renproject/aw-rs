@@ -2,6 +2,7 @@ use aw::conn_manager::{self, peer_table};
 use aw::gossip;
 use aw::message::{Header, To, GOSSIP_PEER_ID};
 use aw::peer;
+use aw::rate;
 use parity_crypto::publickey::{Generator, Random};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::{Duration, Instant};
@@ -36,6 +37,11 @@ async fn main() {
         peer_alpha: 3,
         buffer_size: 100,
     };
+    let listener_rate_limiter_options = rate::Options {
+        capacity: 1000,
+        limit: 10,
+        period: Duration::from_secs(60),
+    };
 
     let keypairs: Vec<_> = (0..n).map(|_| Random.generate()).collect();
 
@@ -55,6 +61,7 @@ async fn main() {
             will_pull,
             gossip_options.clone(),
             peer_options.clone(),
+            listener_rate_limiter_options.clone(),
             0,
             max_connections,
             max_header_len,
