@@ -1,5 +1,6 @@
 use crate::conn_manager::peer_table;
 use crate::message::{self, Header, Message, Variant};
+use crate::rate::Limiter;
 use aes_gcm::aead::{self, generic_array::GenericArray, NewAead};
 use aes_gcm::Aes256Gcm;
 use parity_crypto::publickey::Public;
@@ -35,6 +36,8 @@ fn new_encrypted_connection_task<T: SynDecider + Send + 'static>(
     max_data_len: usize,
     buffer_size: usize,
     decider: T,
+    rate_limiter_burst: usize,
+    rate_limiter_period: Duration,
 ) -> (
     oneshot::Sender<()>,
     mpsc::Sender<TTLOrCancel>,
@@ -52,6 +55,8 @@ fn new_encrypted_connection_task<T: SynDecider + Send + 'static>(
         cipher.clone(),
         max_header_len,
         max_data_len,
+        rate_limiter_burst,
+        rate_limiter_period,
         read_half,
         incoming_tx,
         decider,
@@ -125,6 +130,7 @@ enum ReadFutError {
     Send(SendError<(Public, Message)>),
     Decode(DecodeError),
     UnrequestedSyn,
+    RateLimit,
 }
 
 impl From<message::Error> for ReadFutError {
@@ -150,6 +156,8 @@ async fn read_into_sender<R: AsyncReadExt + Unpin, T: SynDecider>(
     cipher: Aes256Gcm,
     max_header_len: usize,
     max_data_len: usize,
+    rate_limiter_burst: usize,
+    rate_limiter_period: Duration,
     mut reader: R,
     mut sender: mpsc::Sender<(Public, Message)>,
     mut decider: T,
@@ -157,9 +165,13 @@ async fn read_into_sender<R: AsyncReadExt + Unpin, T: SynDecider>(
     use ReadFutError::*;
     // TODO(ross): What should the size of this buffer be?
     let mut buf = [0u8; 1024];
+    let mut limiter = Limiter::new(rate_limiter_burst, rate_limiter_period);
     loop {
         let header_bytes =
             decode_aes_len_encoded(&mut reader, &mut buf, &cipher, max_header_len).await?;
+        if !limiter.allow_many(header_bytes.len()) {
+            return Err(ReadFutError::RateLimit);
+        }
         let header = Header::from_bytes(header_bytes)?;
         if header.variant != Variant::Syn {
             sender.send((pubkey, Message::Header(header))).await?;
@@ -169,6 +181,9 @@ async fn read_into_sender<R: AsyncReadExt + Unpin, T: SynDecider>(
             }
             let message =
                 decode_aes_len_encoded(&mut reader, &mut buf, &cipher, max_data_len).await?;
+            if !limiter.allow_many(message.len()) {
+                return Err(ReadFutError::RateLimit);
+            }
             sender.send((pubkey, Message::Syn(header, message))).await?;
         }
     }
@@ -328,6 +343,8 @@ impl Connection {
         max_header_len: usize,
         max_data_len: usize,
         buffer_size: usize,
+        rate_limiter_burst: usize,
+        rate_limiter_period: Duration,
         stream: TcpStream,
         decider: T,
     ) -> Self {
@@ -353,6 +370,8 @@ impl Connection {
             max_data_len,
             buffer_size,
             decider,
+            rate_limiter_burst,
+            rate_limiter_period,
         );
         Self {
             reader: Some(incoming),
@@ -500,6 +519,8 @@ pub struct ConnectionPool<T> {
     max_header_len: usize,
     max_data_len: usize,
     buffer_size: usize,
+    rate_limiter_burst: usize,
+    rate_limiter_period: Duration,
     connections: HashMap<SocketAddr, Connection>,
     reads_ref: mpsc::Sender<(Public, Message)>,
     decider: T,
@@ -517,16 +538,21 @@ impl<T> ConnectionPool<T> {
         max_header_len: usize,
         max_data_len: usize,
         buffer_size: usize,
+        rate_limiter_burst: usize,
+        bytes_per_second: u32,
         decider: T,
     ) -> (Self, mpsc::Receiver<(Public, Message)>) {
         let connections = HashMap::with_capacity(max_connections);
         let (tx, rx) = mpsc::channel(buffer_size);
+        let rate_limiter_period = Duration::from_secs(1) / bytes_per_second;
         (
             Self {
                 max_connections,
                 max_header_len,
                 max_data_len,
                 buffer_size,
+                rate_limiter_burst,
+                rate_limiter_period,
                 connections,
                 reads_ref: tx,
                 decider,
@@ -615,6 +641,8 @@ impl<T: SynDecider + Clone + Send + 'static> ConnectionPool<T> {
             self.max_header_len,
             self.max_data_len,
             self.buffer_size,
+            self.rate_limiter_burst,
+            self.rate_limiter_period,
             stream,
             self.decider.clone(),
         );
@@ -647,6 +675,8 @@ mod tests {
         let max_header_len = 1024;
         let max_data_len = 1024;
         let buffer_size = 100;
+        let rate_limiter_burst = 1024 * 1024;
+        let rate_limiter_period = Duration::from_millis(1);
 
         let key = rand::random();
         let (client_keypair, server_keypair) = (Random.generate(), Random.generate());
@@ -665,6 +695,8 @@ mod tests {
             max_header_len,
             max_data_len,
             buffer_size,
+            rate_limiter_burst,
+            rate_limiter_period,
             client_stream,
             DummyDecider {},
         );
@@ -675,6 +707,8 @@ mod tests {
             max_header_len,
             max_data_len,
             buffer_size,
+            rate_limiter_burst,
+            rate_limiter_period,
             server_stream,
             DummyDecider {},
         );

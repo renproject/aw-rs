@@ -15,6 +15,8 @@ async fn main() {
     let max_connections = 10;
     let max_header_len = 1024;
     let max_data_len = 1024;
+    let rate_limiter_burst = 1024 * 1024;
+    let bytes_per_second = 1024 * 1024;
     let buffer_size = 100;
     let alpha = 3;
     let gossip_options = gossip::Options {
@@ -67,6 +69,8 @@ async fn main() {
             max_header_len,
             max_data_len,
             buffer_size,
+            rate_limiter_burst,
+            bytes_per_second,
         )
         .expect("creaing aw task");
 

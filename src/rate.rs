@@ -9,6 +9,15 @@ pub struct Limiter {
 }
 
 impl Limiter {
+    pub fn new(limit: usize, period: Duration) -> Self {
+        let inner = __Limiter::new();
+        Self {
+            limit,
+            period,
+            inner,
+        }
+    }
+
     pub fn allow(&mut self) -> bool {
         self.inner.allow(self.limit, self.period)
     }
@@ -35,11 +44,13 @@ impl __Limiter {
         self.allow_many(limit, period, 1)
     }
 
+    // NOTE(ross): Using an implemntation based on a period in the context of a data bandwidth rate
+    // limiter means that the highest rate this rate limiter can be configured to use is 1 Gb/s
+    // (assuming a unit of a byte, it would be less if the unit was a bit). This is probably more
+    // than what we would ever set it to for our use cases, but if it needs to go higher then we
+    // will need to think about a frequency based implemntation, most likely using floats.
     fn allow_many(&mut self, limit: usize, period: Duration, count: usize) -> bool {
         let arrival_time = Instant::now();
-
-        // The number of nanoseconds that can fit in a u128 is so obscene that we do not need to be
-        // worried about overflow.
         let drips_since_last_update = arrival_time
             .duration_since(self.last_update_time)
             .as_nanos()
@@ -77,6 +88,7 @@ impl __Limiter {
 }
 
 pub struct BoundedUniformLimiterMap<K> {
+    capacity: usize,
     limit: usize,
     period: Duration,
     limiters: HashMap<K, __Limiter>,
@@ -91,6 +103,11 @@ pub struct Options {
 }
 
 impl<K> BoundedUniformLimiterMap<K> {
+    /// NOTE: The given capacity will be used to construct the underlying data structures, but for
+    /// the given APIs (specifically `std::collections::HashMap` and `std::collections::VecDeque`)
+    /// the call to `with_capacity` has the possibility of generating more memory than what is
+    /// needed for the requested capacity. It will however be ensured that the lengths of these
+    /// data structures never exceeds the given capacity.
     pub fn new(options: Options) -> Self {
         let Options {
             capacity,
@@ -100,6 +117,7 @@ impl<K> BoundedUniformLimiterMap<K> {
         let limiters = HashMap::with_capacity(capacity);
         let chronologically_ordered_keys = VecDeque::with_capacity(capacity);
         Self {
+            capacity,
             limit,
             period,
             limiters,
@@ -119,9 +137,7 @@ where
     pub fn allow_many(&mut self, key: K, count: usize) -> bool {
         match self.limiters.get_mut(&key) {
             None => {
-                if self.chronologically_ordered_keys.len()
-                    == self.chronologically_ordered_keys.capacity()
-                {
+                if self.chronologically_ordered_keys.len() == self.capacity {
                     let old_key = self.chronologically_ordered_keys.pop_front().unwrap();
                     self.limiters.remove(&old_key);
                 }
@@ -132,6 +148,70 @@ where
                 allow
             }
             Some(limiter) => limiter.allow_many(self.limit, self.period, count),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn limiter_rejects_too_many_cells() {
+        let limit = 10;
+        let period = Duration::from_secs(1000);
+        let mut limiter = Limiter::new(limit, period);
+
+        for _ in 0..limit {
+            assert!(limiter.allow());
+        }
+        assert!(!limiter.allow());
+    }
+
+    #[test]
+    fn limiter_drips_at_given_rate() {
+        let limit = 10;
+        let period = Duration::from_millis(1);
+        let mut limiter = Limiter::new(limit, period);
+
+        for _ in 0..limit {
+            assert!(limiter.allow());
+        }
+
+        let drips = 5;
+        std::thread::sleep(Duration::from_millis(drips));
+        for _ in 0..drips {
+            assert!(limiter.allow());
+        }
+        assert!(!limiter.allow());
+    }
+
+    #[test]
+    fn bounded_uniform_limiter_maintains_capacity() {
+        let capacity = 10;
+        let options = Options {
+            capacity,
+            limit: 10,
+            period: Duration::from_secs(1),
+        };
+        let mut limiter = BoundedUniformLimiterMap::new(options);
+        let vec_cap = limiter.chronologically_ordered_keys.capacity();
+        let map_cap = limiter.limiters.capacity();
+
+        for i in 0..1000 {
+            limiter.allow(i);
+            assert_eq!(
+                limiter.chronologically_ordered_keys.len(),
+                limiter.limiters.len()
+            );
+
+            // The length is always bounded by the specified capacity.
+            assert!(limiter.limiters.len() <= capacity);
+
+            // The allocated memory for the `HashMap` and the `VecDeque` never changes; this
+            // implies that new memory is never allocated for them.
+            assert_eq!(limiter.chronologically_ordered_keys.capacity(), vec_cap);
+            assert_eq!(limiter.limiters.capacity(), map_cap);
         }
     }
 }

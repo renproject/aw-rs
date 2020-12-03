@@ -356,8 +356,17 @@ mod tests {
             loop {}
         });
 
-        let (mut pool, _) =
-            ConnectionPool::new_with_max_connections_allocated(10, 256, 256, 100, Decider::new());
+        let rate_limiter_burst = 1024 * 1024;
+        let bytes_per_second = 1024 * 1024;
+        let (mut pool, _) = ConnectionPool::new_with_max_connections_allocated(
+            10,
+            256,
+            256,
+            100,
+            rate_limiter_burst,
+            bytes_per_second,
+            Decider::new(),
+        );
         let mut table = PeerTable::new();
         let keypair = Random.generate();
         let peer_pubkey = *Random.generate().public();

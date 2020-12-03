@@ -38,6 +38,8 @@ async fn main() {
     let max_header_len = 512;
     let max_data_len = 2048;
     let buffer_size = 100;
+    let rate_limiter_burst = 1024 * 1024;
+    let bytes_per_second = 1024 * 1024;
     let alpha = 3;
     let own_addr = None; // TODO(ross)
     let gossip_options = gossip::Options {
@@ -81,6 +83,8 @@ async fn main() {
         max_header_len,
         max_data_len,
         buffer_size,
+        rate_limiter_burst,
+        bytes_per_second,
     )
     .expect("creating aw task");
     let aw_handle = tokio::spawn(aw_fut);

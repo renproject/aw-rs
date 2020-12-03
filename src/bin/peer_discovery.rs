@@ -24,6 +24,8 @@ fn create_peer() -> (
     let max_connections = 100;
     let max_header_len = 1024;
     let max_data_len = 1024;
+    let rate_limiter_burst = 1024 * 1024;
+    let bytes_per_second = 1024 * 1024;
 
     let pinger_options = PingerOptions {
         ping_interval: Duration::from_millis(10),
@@ -52,6 +54,8 @@ fn create_peer() -> (
         max_header_len,
         max_data_len,
         options.buffer_size,
+        rate_limiter_burst,
+        bytes_per_second,
         decider,
     );
     let table = PeerTable::new();

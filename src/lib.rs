@@ -45,6 +45,8 @@ pub fn new_aw_task<F>(
     max_header_len: usize,
     max_data_len: usize,
     buffer_size: usize,
+    rate_limiter_burst: usize,
+    bytes_per_second: u32,
 ) -> Result<
     (
         impl Future<Output = Result<(), Error>>,
@@ -64,6 +66,8 @@ where
         max_header_len,
         max_data_len,
         buffer_size,
+        rate_limiter_burst,
+        bytes_per_second,
         decider.clone(),
     );
     let table = PeerTable::new();
@@ -141,6 +145,8 @@ mod tests {
         let max_header_len = 1024;
         let max_data_len = 1024;
         let buffer_size = 100;
+        let rate_limiter_burst = 1024 * 1024;
+        let bytes_per_second = 1024 * 1024;
         let alpha = 3;
         let own_addr = None;
         let gossip_options = gossip::Options {
@@ -193,6 +199,8 @@ mod tests {
                 max_header_len,
                 max_data_len,
                 buffer_size,
+                rate_limiter_burst,
+                bytes_per_second,
             )
             .expect("creaing aw task");
 
