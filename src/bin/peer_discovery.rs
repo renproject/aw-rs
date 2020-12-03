@@ -1,11 +1,11 @@
 use aw::conn_manager::{
     self,
-    connection::ConnectionPool,
+    connection::{self, ConnectionPool},
     peer_table::{PeerTable, SignedAddress},
     ConnectionManager,
 };
 use aw::gossip::Decider;
-use aw::peer::{self, Options, PingerOptions};
+use aw::peer::{self, Options};
 use aw::rate;
 use futures::Future;
 use futures::FutureExt;
@@ -21,25 +21,11 @@ fn create_peer() -> (
     Arc<Mutex<ConnectionManager<Decider>>>,
     impl Future<Output = ()>,
 ) {
-    let max_connections = 100;
-    let max_header_len = 1024;
-    let max_data_len = 1024;
-    let rate_limiter_burst = 1024 * 1024;
-    let bytes_per_second = 1024 * 1024;
+    let pool_options = connection::Options::default();
 
-    let pinger_options = PingerOptions {
-        ping_interval: Duration::from_millis(10),
-        ping_alpha: 3,
-        ping_ttl: Duration::from_secs(10),
-        send_backoff: Duration::from_millis(1),
-        send_backoff_multiplier: 1.6,
-    };
-    let options = Options {
-        pinger_options,
-        peer_alpha: 3,
-        buffer_size: 100,
-    };
-    let listener_rate_limiter_options = rate::Options {
+    let mut options = Options::default();
+    options.pinger_options.ping_interval = Duration::from_millis(10);
+    let listener_rate_limiter_options = rate::MapOptions {
         capacity: 1000,
         limit: 10,
         period: Duration::from_secs(60),
@@ -49,15 +35,8 @@ fn create_peer() -> (
     let addr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
 
     let decider = Decider::new();
-    let (pool, mut pool_receiver) = ConnectionPool::new_with_max_connections_allocated(
-        max_connections,
-        max_header_len,
-        max_data_len,
-        options.buffer_size,
-        rate_limiter_burst,
-        bytes_per_second,
-        decider,
-    );
+    let (pool, mut pool_receiver) =
+        ConnectionPool::new_with_max_connections_allocated(pool_options, decider);
     let table = PeerTable::new();
     let conn_manager = Arc::new(Mutex::new(ConnectionManager::new(pool, table)));
     let (port, listen_fut) = conn_manager::listen_for_peers(

@@ -229,7 +229,7 @@ pub fn listen_for_peers<T: SynDecider + Clone + Send + 'static>(
     keypair: KeyPair,
     addr: IpAddr,
     port: u16,
-    rate_limiter_options: rate::Options,
+    rate_limiter_options: rate::MapOptions,
 ) -> Result<(u16, impl Future<Output = ()>), io::Error> {
     // NOTE(ross): Here we block on binding the listener, because when binding to a socket address
     // (or more specifically an address that doesn't require a DNS lookup) the call should complete
@@ -340,7 +340,7 @@ async fn add_to_pool_with_reuse<T: SynDecider + Clone + Send + 'static>(
 mod tests {
     use super::*;
     use crate::gossip::Decider;
-    use connection::ConnectionPool;
+    use connection::{self, ConnectionPool};
     use parity_crypto::publickey::{Generator, Random};
     use peer_table::PeerTable;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -356,17 +356,9 @@ mod tests {
             loop {}
         });
 
-        let rate_limiter_burst = 1024 * 1024;
-        let bytes_per_second = 1024 * 1024;
-        let (mut pool, _) = ConnectionPool::new_with_max_connections_allocated(
-            10,
-            256,
-            256,
-            100,
-            rate_limiter_burst,
-            bytes_per_second,
-            Decider::new(),
-        );
+        let pool_options = connection::Options::default();
+        let (mut pool, _) =
+            ConnectionPool::new_with_max_connections_allocated(pool_options, Decider::new());
         let mut table = PeerTable::new();
         let keypair = Random.generate();
         let peer_pubkey = *Random.generate().public();

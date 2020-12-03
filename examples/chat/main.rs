@@ -2,7 +2,10 @@ use aw::gossip;
 use aw::message::{Header, To, GOSSIP_PEER_ID};
 use aw::peer;
 use aw::rate;
-use aw::{conn_manager, util, ConnectionManager};
+use aw::{
+    conn_manager::{self, connection},
+    util, ConnectionManager,
+};
 use parity_crypto::publickey;
 use parity_crypto::publickey::{Generator, KeyPair, Public, Random};
 use std::convert::TryFrom;
@@ -34,35 +37,11 @@ async fn main() {
     let keypair = Random.generate();
     let own_pubkey = *keypair.public();
 
-    let max_connections = 10;
-    let max_header_len = 512;
-    let max_data_len = 2048;
-    let buffer_size = 100;
-    let rate_limiter_burst = 1024 * 1024;
-    let bytes_per_second = 1024 * 1024;
-    let alpha = 3;
     let own_addr = None; // TODO(ross)
-    let gossip_options = gossip::Options {
-        buffer_size,
-        alpha,
-        send_timeout: Duration::from_secs(30),
-        ttl: Some(Duration::from_secs(30)),
-        initial_backoff: Duration::from_secs(1),
-        backoff_multiplier: 1.6,
-    };
-    let pinger_options = peer::PingerOptions {
-        ping_interval: Duration::from_secs(1),
-        ping_alpha: 3,
-        ping_ttl: Duration::from_secs(30),
-        send_backoff: Duration::from_secs(1),
-        send_backoff_multiplier: 1.6,
-    };
-    let peer_options = peer::Options {
-        pinger_options,
-        peer_alpha: 3,
-        buffer_size: 100,
-    };
-    let listener_rate_limiter_options = rate::Options {
+    let pool_options = connection::Options::default();
+    let gossip_options = gossip::Options::default();
+    let peer_options = peer::Options::default();
+    let listener_rate_limiter_options = rate::MapOptions {
         capacity: 1000,
         limit: 10,
         period: Duration::from_secs(60),
@@ -79,12 +58,7 @@ async fn main() {
         peer_options,
         listener_rate_limiter_options,
         port,
-        max_connections,
-        max_header_len,
-        max_data_len,
-        buffer_size,
-        rate_limiter_burst,
-        bytes_per_second,
+        pool_options,
     )
     .expect("creating aw task");
     let aw_handle = tokio::spawn(aw_fut);

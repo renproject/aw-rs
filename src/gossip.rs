@@ -21,6 +21,19 @@ pub struct Options {
     pub backoff_multiplier: f64,
 }
 
+impl Default for Options {
+    fn default() -> Self {
+        Self {
+            buffer_size: 100,
+            alpha: 3,
+            send_timeout: Duration::from_secs(10),
+            ttl: Some(Duration::from_secs(30)),
+            initial_backoff: Duration::from_secs(1),
+            backoff_multiplier: 1.6,
+        }
+    }
+}
+
 pub fn gossip_task<F>(
     keypair: KeyPair,
     conn_manager: Arc<Mutex<ConnectionManager<Decider>>>,

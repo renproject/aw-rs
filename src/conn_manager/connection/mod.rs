@@ -1,6 +1,6 @@
 use crate::conn_manager::peer_table;
 use crate::message::{self, Header, Message, Variant};
-use crate::rate::Limiter;
+use crate::rate::{self, Limiter};
 use aes_gcm::aead::{self, generic_array::GenericArray, NewAead};
 use aes_gcm::Aes256Gcm;
 use parity_crypto::publickey::Public;
@@ -36,8 +36,7 @@ fn new_encrypted_connection_task<T: SynDecider + Send + 'static>(
     max_data_len: usize,
     buffer_size: usize,
     decider: T,
-    rate_limiter_burst: usize,
-    rate_limiter_period: Duration,
+    rate_limiter_options: rate::Options,
 ) -> (
     oneshot::Sender<()>,
     mpsc::Sender<TTLOrCancel>,
@@ -55,8 +54,7 @@ fn new_encrypted_connection_task<T: SynDecider + Send + 'static>(
         cipher.clone(),
         max_header_len,
         max_data_len,
-        rate_limiter_burst,
-        rate_limiter_period,
+        rate_limiter_options,
         read_half,
         incoming_tx,
         decider,
@@ -156,8 +154,7 @@ async fn read_into_sender<R: AsyncReadExt + Unpin, T: SynDecider>(
     cipher: Aes256Gcm,
     max_header_len: usize,
     max_data_len: usize,
-    rate_limiter_burst: usize,
-    rate_limiter_period: Duration,
+    rate_limiter_options: rate::Options,
     mut reader: R,
     mut sender: mpsc::Sender<(Public, Message)>,
     mut decider: T,
@@ -165,7 +162,7 @@ async fn read_into_sender<R: AsyncReadExt + Unpin, T: SynDecider>(
     use ReadFutError::*;
     // TODO(ross): What should the size of this buffer be?
     let mut buf = [0u8; 1024];
-    let mut limiter = Limiter::new(rate_limiter_burst, rate_limiter_period);
+    let mut limiter = Limiter::new(rate_limiter_options);
     loop {
         let header_bytes =
             decode_aes_len_encoded(&mut reader, &mut buf, &cipher, max_header_len).await?;
@@ -343,8 +340,7 @@ impl Connection {
         max_header_len: usize,
         max_data_len: usize,
         buffer_size: usize,
-        rate_limiter_burst: usize,
-        rate_limiter_period: Duration,
+        rate_limiter_options: rate::Options,
         stream: TcpStream,
         decider: T,
     ) -> Self {
@@ -354,7 +350,7 @@ impl Connection {
         // not send the next message until the previous send has been ACKed, which may be delayed
         // 40ms at the receiver side, not to mention any network delays.
         //
-        // NOTE(ross): We are unwrapping this because the error cases expressed in `man 3
+        // TODO(ross): We are unwrapping this because the error cases expressed in `man 3
         // setsockopt` seem like they would not occurr in a properly functioning system. However,
         // do we want to recover anyway and not set the option?
         stream
@@ -370,8 +366,7 @@ impl Connection {
             max_data_len,
             buffer_size,
             decider,
-            rate_limiter_burst,
-            rate_limiter_period,
+            rate_limiter_options,
         );
         Self {
             reader: Some(incoming),
@@ -519,8 +514,10 @@ pub struct ConnectionPool<T> {
     max_header_len: usize,
     max_data_len: usize,
     buffer_size: usize,
-    rate_limiter_burst: usize,
-    rate_limiter_period: Duration,
+    // TODO(ross): Should we have per connection rate limits instead? This would make some sense
+    // because in general we would want higher allowed rates for long lived connections and lower
+    // allowed rates for short lived connections.
+    rate_limiter_options: rate::Options,
     connections: HashMap<SocketAddr, Connection>,
     reads_ref: mpsc::Sender<(Public, Message)>,
     decider: T,
@@ -532,27 +529,57 @@ pub enum PoolError {
     PeerAddr(std::io::Error),
 }
 
+#[derive(Debug, Copy, Clone)]
+pub struct Options {
+    pub max_connections: usize,
+    pub max_header_len: usize,
+    pub max_data_len: usize,
+    pub buffer_size: usize,
+    pub rate_limiter_burst: usize,
+    pub bytes_per_second: u32,
+}
+
+impl Default for Options {
+    fn default() -> Self {
+        Self {
+            max_connections: 1000,
+            max_header_len: 1024,
+            max_data_len: 100 * 1024,
+            buffer_size: 100,
+            rate_limiter_burst: 1024 * 1024,
+            bytes_per_second: 1024 * 1024,
+        }
+    }
+}
+
 impl<T> ConnectionPool<T> {
     pub fn new_with_max_connections_allocated(
-        max_connections: usize,
-        max_header_len: usize,
-        max_data_len: usize,
-        buffer_size: usize,
-        rate_limiter_burst: usize,
-        bytes_per_second: u32,
+        options: Options,
         decider: T,
     ) -> (Self, mpsc::Receiver<(Public, Message)>) {
+        let Options {
+            max_connections,
+            max_header_len,
+            max_data_len,
+            buffer_size,
+            rate_limiter_burst,
+            bytes_per_second,
+        } = options;
+
         let connections = HashMap::with_capacity(max_connections);
         let (tx, rx) = mpsc::channel(buffer_size);
-        let rate_limiter_period = Duration::from_secs(1) / bytes_per_second;
+        let period = Duration::from_secs(1) / bytes_per_second;
+        let rate_limiter_options = rate::Options {
+            limit: rate_limiter_burst,
+            period,
+        };
         (
             Self {
                 max_connections,
                 max_header_len,
                 max_data_len,
                 buffer_size,
-                rate_limiter_burst,
-                rate_limiter_period,
+                rate_limiter_options,
                 connections,
                 reads_ref: tx,
                 decider,
@@ -641,8 +668,7 @@ impl<T: SynDecider + Clone + Send + 'static> ConnectionPool<T> {
             self.max_header_len,
             self.max_data_len,
             self.buffer_size,
-            self.rate_limiter_burst,
-            self.rate_limiter_period,
+            self.rate_limiter_options,
             stream,
             self.decider.clone(),
         );
@@ -675,8 +701,10 @@ mod tests {
         let max_header_len = 1024;
         let max_data_len = 1024;
         let buffer_size = 100;
-        let rate_limiter_burst = 1024 * 1024;
-        let rate_limiter_period = Duration::from_millis(1);
+        let rate_limiter_options = rate::Options {
+            limit: 1024 * 1024,
+            period: Duration::from_millis(1),
+        };
 
         let key = rand::random();
         let (client_keypair, server_keypair) = (Random.generate(), Random.generate());
@@ -695,8 +723,7 @@ mod tests {
             max_header_len,
             max_data_len,
             buffer_size,
-            rate_limiter_burst,
-            rate_limiter_period,
+            rate_limiter_options,
             client_stream,
             DummyDecider {},
         );
@@ -707,8 +734,7 @@ mod tests {
             max_header_len,
             max_data_len,
             buffer_size,
-            rate_limiter_burst,
-            rate_limiter_period,
+            rate_limiter_options,
             server_stream,
             DummyDecider {},
         );

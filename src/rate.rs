@@ -8,8 +8,24 @@ pub struct Limiter {
     inner: __Limiter,
 }
 
+#[derive(Debug, Copy, Clone)]
+pub struct Options {
+    pub limit: usize,
+    pub period: Duration,
+}
+
+impl Default for Options {
+    fn default() -> Self {
+        Self {
+            limit: 10,
+            period: Duration::from_secs(1),
+        }
+    }
+}
+
 impl Limiter {
-    pub fn new(limit: usize, period: Duration) -> Self {
+    pub fn new(options: Options) -> Self {
+        let Options { limit, period } = options;
         let inner = __Limiter::new();
         Self {
             limit,
@@ -96,7 +112,7 @@ pub struct BoundedUniformLimiterMap<K> {
 }
 
 #[derive(Debug, Clone)]
-pub struct Options {
+pub struct MapOptions {
     pub capacity: usize,
     pub limit: usize,
     pub period: Duration,
@@ -108,8 +124,8 @@ impl<K> BoundedUniformLimiterMap<K> {
     /// the call to `with_capacity` has the possibility of generating more memory than what is
     /// needed for the requested capacity. It will however be ensured that the lengths of these
     /// data structures never exceeds the given capacity.
-    pub fn new(options: Options) -> Self {
-        let Options {
+    pub fn new(options: MapOptions) -> Self {
+        let MapOptions {
             capacity,
             limit,
             period,
@@ -158,11 +174,13 @@ mod tests {
 
     #[test]
     fn limiter_rejects_too_many_cells() {
-        let limit = 10;
-        let period = Duration::from_secs(1000);
-        let mut limiter = Limiter::new(limit, period);
+        let options = Options {
+            limit: 10,
+            period: Duration::from_secs(1000),
+        };
+        let mut limiter = Limiter::new(options);
 
-        for _ in 0..limit {
+        for _ in 0..options.limit {
             assert!(limiter.allow());
         }
         assert!(!limiter.allow());
@@ -170,11 +188,13 @@ mod tests {
 
     #[test]
     fn limiter_drips_at_given_rate() {
-        let limit = 10;
-        let period = Duration::from_millis(1);
-        let mut limiter = Limiter::new(limit, period);
+        let options = Options {
+            limit: 10,
+            period: Duration::from_millis(1),
+        };
+        let mut limiter = Limiter::new(options);
 
-        for _ in 0..limit {
+        for _ in 0..options.limit {
             assert!(limiter.allow());
         }
 
@@ -189,7 +209,7 @@ mod tests {
     #[test]
     fn bounded_uniform_limiter_maintains_capacity() {
         let capacity = 10;
-        let options = Options {
+        let options = MapOptions {
             capacity,
             limit: 10,
             period: Duration::from_secs(1),

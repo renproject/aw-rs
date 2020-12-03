@@ -1,4 +1,4 @@
-use aw::conn_manager::{self, peer_table};
+use aw::conn_manager::{self, connection, peer_table};
 use aw::gossip;
 use aw::message::{Header, To, GOSSIP_PEER_ID};
 use aw::peer;
@@ -12,34 +12,10 @@ async fn main() {
     // Numer of peers.
     let n = 10;
 
-    let max_connections = 10;
-    let max_header_len = 1024;
-    let max_data_len = 1024;
-    let rate_limiter_burst = 1024 * 1024;
-    let bytes_per_second = 1024 * 1024;
-    let buffer_size = 100;
-    let alpha = 3;
-    let gossip_options = gossip::Options {
-        buffer_size,
-        alpha,
-        send_timeout: Duration::from_secs(1),
-        ttl: Some(Duration::from_secs(10)),
-        initial_backoff: Duration::from_secs(1),
-        backoff_multiplier: 1.6,
-    };
-    let pinger_options = peer::PingerOptions {
-        ping_interval: Duration::from_secs(1),
-        ping_alpha: 3,
-        ping_ttl: Duration::from_secs(10),
-        send_backoff: Duration::from_secs(1),
-        send_backoff_multiplier: 1.6,
-    };
-    let peer_options = peer::Options {
-        pinger_options,
-        peer_alpha: 3,
-        buffer_size: 100,
-    };
-    let listener_rate_limiter_options = rate::Options {
+    let pool_options = connection::Options::default();
+    let gossip_options = gossip::Options::default();
+    let peer_options = peer::Options::default();
+    let listener_rate_limiter_options = rate::MapOptions {
         capacity: 1000,
         limit: 10,
         period: Duration::from_secs(60),
@@ -65,12 +41,7 @@ async fn main() {
             peer_options.clone(),
             listener_rate_limiter_options.clone(),
             0,
-            max_connections,
-            max_header_len,
-            max_data_len,
-            buffer_size,
-            rate_limiter_burst,
-            bytes_per_second,
+            pool_options,
         )
         .expect("creaing aw task");
 
